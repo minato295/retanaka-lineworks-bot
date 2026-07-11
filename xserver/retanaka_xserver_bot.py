@@ -1,0 +1,964 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Xserver Cron runner for Tanaka recycle prices -> LINE WORKS Incoming Webhook.
+
+Python 3.6+ (Xserver shared hosting compatible) / standard library only.
+"""
+
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time as time_module
+from datetime import datetime, timezone
+from email.header import Header
+from email.mime.text import MIMEText
+from html import unescape
+from pathlib import Path
+from typing import NamedTuple, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+DEFAULT_PRICE_URL = "https://gold.tanaka.co.jp/retanaka/price/"
+LINEWORKS_WEBHOOK_PREFIX = "https://webhook.worksmobile.com/message/"
+SCREENSHOT_API_URL = "https://api.screenshotone.com/take"
+DEFAULT_SECTION_SELECTOR = "#contents article > section"
+DEFAULT_WAIT_SELECTOR = "#price_tables"
+DEFAULT_SCREENSHOT_RETENTION_HOURS = 72
+MAX_SCREENSHOT_BYTES = 10 * 1024 * 1024
+
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"[ \t\r\f\v]+")
+_BLANK_LINES_RE = re.compile(r"\n+")
+
+INTERNAL_TS_FORMAT = "%Y-%m-%d %H:%M"
+DISPLAY_WEEKDAYS = ("月", "火", "水", "木", "金", "土", "日")
+MAX_HISTORY = 90
+
+
+class PriceSnapshot(NamedTuple):
+    published_at: str
+    k24: int
+    pt: int
+    fetched_at: str
+
+
+def make_empty_state():
+    return {
+        "history": [],
+        "last_sent_published_at": None,
+        "last_attempt_date": None,
+        "error_alert_dates": {},
+        "test_email_sent_at": None,
+    }
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).resolve().parent / "config.json"),
+        help="config JSON path (default: ./config.json)",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="LINE WORKS送信せず通知内容のみ出力")
+    parser.add_argument("--force-send", action="store_true", help="同一発表時刻でも送信")
+    return parser.parse_args(argv)
+
+
+def parse_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    return default
+
+
+def normalize_path(config_dir, raw_value, default_value):
+    raw = str(raw_value).strip() if raw_value is not None else ""
+    path = Path(raw or default_value)
+    if not path.is_absolute():
+        path = config_dir / path
+    return str(path)
+
+
+def read_alert_config_only(path):
+    config_path = Path(path)
+    config_dir = config_path.resolve().parent
+    default_state = config_dir / "storage" / "retanaka_price_state.json"
+    config = {
+        "alert_email": "",
+        "alert_email_from": "retanaka-bot@localhost",
+        "sendmail_path": "/usr/sbin/sendmail",
+        "state_file": str(default_state),
+    }
+
+    if not config_path.exists():
+        return config
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return config
+
+    if not isinstance(data, dict):
+        return config
+
+    config["alert_email"] = str(data.get("alert_email", "")).strip()
+    config["alert_email_from"] = (
+        str(data.get("alert_email_from", "retanaka-bot@localhost")).strip() or "retanaka-bot@localhost"
+    )
+    config["sendmail_path"] = str(data.get("sendmail_path", "/usr/sbin/sendmail")).strip() or "/usr/sbin/sendmail"
+    config["state_file"] = normalize_path(config_dir, data.get("state_file"), str(default_state))
+    return config
+
+
+def read_config(path):
+    config_path = Path(path)
+    config_dir = config_path.resolve().parent
+    if not config_path.exists():
+        raise RuntimeError("config file not found: {0}".format(config_path))
+
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise RuntimeError("invalid JSON config: {0}".format(exc))
+
+    if not isinstance(config, dict):
+        raise RuntimeError("config root must be object")
+
+    required = ["lineworks_webhook_url"]
+    for key in required:
+        value = str(config.get(key, "")).strip()
+        if not value:
+            raise RuntimeError("missing required config key: {0}".format(key))
+        config[key] = value
+
+    if not config["lineworks_webhook_url"].startswith(LINEWORKS_WEBHOOK_PREFIX):
+        raise RuntimeError("lineworks_webhook_url must start with {0}".format(LINEWORKS_WEBHOOK_PREFIX))
+
+    config["price_url"] = str(config.get("price_url", DEFAULT_PRICE_URL)).strip() or DEFAULT_PRICE_URL
+    config["timezone"] = str(config.get("timezone", "Asia/Tokyo")).strip() or "Asia/Tokyo"
+    config["alert_email"] = str(config.get("alert_email", "")).strip()
+    config["alert_email_from"] = (
+        str(config.get("alert_email_from", "retanaka-bot@localhost")).strip() or "retanaka-bot@localhost"
+    )
+    config["sendmail_path"] = str(config.get("sendmail_path", "/usr/sbin/sendmail")).strip() or "/usr/sbin/sendmail"
+
+    default_state = config_dir / "storage" / "retanaka_price_state.json"
+    config["state_file"] = normalize_path(config_dir, config.get("state_file"), str(default_state))
+
+    # Screenshot settings
+    config["enable_section_screenshot"] = parse_bool(config.get("enable_section_screenshot", False), False)
+    config["require_screenshot"] = parse_bool(config.get("require_screenshot", True), True)
+    config["screenshot_api_url"] = (
+        str(config.get("screenshot_api_url", SCREENSHOT_API_URL)).strip() or SCREENSHOT_API_URL
+    )
+    config["screenshot_selector"] = (
+        str(config.get("screenshot_selector", DEFAULT_SECTION_SELECTOR)).strip() or DEFAULT_SECTION_SELECTOR
+    )
+    config["screenshot_wait_for_selector"] = (
+        str(config.get("screenshot_wait_for_selector", DEFAULT_WAIT_SELECTOR)).strip() or DEFAULT_WAIT_SELECTOR
+    )
+    raw_hide = config.get("screenshot_hide_selectors", ["#contents article > section > p.buttons"])
+    if isinstance(raw_hide, str):
+        hide_selectors = [item.strip() for item in raw_hide.split(",") if item.strip()]
+    elif isinstance(raw_hide, list):
+        hide_selectors = [str(item).strip() for item in raw_hide if str(item).strip()]
+    else:
+        hide_selectors = []
+    config["screenshot_hide_selectors"] = hide_selectors
+
+    try:
+        retention = int(config.get("screenshot_retention_hours", DEFAULT_SCREENSHOT_RETENTION_HOURS))
+    except Exception:
+        retention = DEFAULT_SCREENSHOT_RETENTION_HOURS
+    config["screenshot_retention_hours"] = retention if retention > 0 else DEFAULT_SCREENSHOT_RETENTION_HOURS
+    try:
+        delete_after = int(config.get("screenshot_delete_after_seconds", 0))
+    except Exception:
+        delete_after = 0
+    config["screenshot_delete_after_seconds"] = delete_after if delete_after >= 0 else 0
+
+    if config["enable_section_screenshot"]:
+        access_key = str(config.get("screenshotone_access_key", "")).strip()
+        if not access_key:
+            raise RuntimeError("missing required config key: screenshotone_access_key")
+        config["screenshotone_access_key"] = access_key
+
+        public_base = str(config.get("screenshot_public_base_url", "")).strip().rstrip("/")
+        if not public_base.startswith("https://"):
+            raise RuntimeError("screenshot_public_base_url must start with https://")
+        config["screenshot_public_base_url"] = public_base
+
+        default_public_dir = config_dir / "public_images"
+        config["screenshot_public_dir"] = normalize_path(
+            config_dir,
+            config.get("screenshot_public_dir"),
+            str(default_public_dir),
+        )
+
+    # Keep this script robust on shared hosting even without env vars.
+    os.environ["TZ"] = config["timezone"]
+    if hasattr(time_module, "tzset"):
+        time_module.tzset()
+
+    return config
+
+
+def fetch_html(url):
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; retanaka-xserver-bot/1.0)",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        },
+    )
+    context = build_ssl_context()
+    with urlopen(request, timeout=30, context=context) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def html_to_text(html):
+    text = _SCRIPT_STYLE_RE.sub("\n", html)
+    text = _TAG_RE.sub("\n", text)
+    text = unescape(text)
+    text = text.replace("\u3000", " ")
+    text = _WHITESPACE_RE.sub(" ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = _BLANK_LINES_RE.sub("\n", text)
+    return text.strip()
+
+
+def extract_price(text, label):
+    pattern = re.compile(r"{0}\s*[¥￥]?\s*([0-9][0-9,]*)".format(re.escape(label)))
+    match = pattern.search(text)
+    if not match:
+        raise RuntimeError("{0} の価格を取得できませんでした".format(label))
+    return int(match.group(1).replace(",", ""))
+
+
+def extract_published_at(text):
+    match = re.search(
+        r"([0-9]{4}年\s*[0-9]{1,2}月\s*[0-9]{1,2}日\s*[0-9]{1,2}:[0-9]{2})\s*発表",
+        text,
+    )
+    if not match:
+        raise RuntimeError("価格の発表日時を取得できませんでした")
+
+    raw = re.sub(r"\s+", "", match.group(1))
+    dt = datetime.strptime(raw, "%Y年%m月%d日%H:%M")
+    return dt.strftime(INTERNAL_TS_FORMAT)
+
+
+def parse_snapshot(html):
+    text = html_to_text(html)
+    return PriceSnapshot(
+        published_at=extract_published_at(text),
+        k24=extract_price(text, "K24特定品"),
+        pt=extract_price(text, "Pt特定品"),
+        fetched_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
+def load_state(path):
+    state_path = Path(path)
+    if not state_path.exists():
+        return make_empty_state()
+
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except ValueError:
+        return make_empty_state()
+
+    history = data.get("history") if isinstance(data, dict) else []
+    if not isinstance(history, list):
+        history = []
+
+    normalized = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        published_at = item.get("published_at")
+        k24 = item.get("k24")
+        pt = item.get("pt")
+        if not isinstance(published_at, str):
+            continue
+        if not isinstance(k24, int) or not isinstance(pt, int):
+            continue
+        normalized.append(
+            {
+                "published_at": published_at,
+                "k24": k24,
+                "pt": pt,
+                "fetched_at": str(item.get("fetched_at", "")),
+            }
+        )
+
+    last_sent = data.get("last_sent_published_at") if isinstance(data, dict) else None
+    if not isinstance(last_sent, str):
+        last_sent = None
+    last_attempt_date = data.get("last_attempt_date") if isinstance(data, dict) else None
+    if not isinstance(last_attempt_date, str):
+        last_attempt_date = None
+    raw_error_alert_dates = data.get("error_alert_dates") if isinstance(data, dict) else {}
+    if not isinstance(raw_error_alert_dates, dict):
+        raw_error_alert_dates = {}
+    error_alert_dates = {}
+    for key, value in raw_error_alert_dates.items():
+        if isinstance(key, str) and isinstance(value, str):
+            error_alert_dates[key] = value
+    test_email_sent_at = data.get("test_email_sent_at") if isinstance(data, dict) else None
+    if not isinstance(test_email_sent_at, str):
+        test_email_sent_at = None
+
+    state = make_empty_state()
+    state.update(
+        {
+            "history": normalized,
+            "last_sent_published_at": last_sent,
+            "last_attempt_date": last_attempt_date,
+            "error_alert_dates": error_alert_dates,
+            "test_email_sent_at": test_email_sent_at,
+        }
+    )
+    return state
+
+
+def save_state(path, state):
+    state_path = Path(path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = Path(str(state_path) + ".tmp")
+    tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(state_path)
+    try:
+        os.chmod(str(state_path), 0o600)
+    except Exception:
+        pass
+
+
+def upsert_history(state, snapshot):
+    by_published = {}
+    for item in state.get("history", []):
+        key = item.get("published_at")
+        if isinstance(key, str):
+            by_published[key] = item
+
+    by_published[snapshot.published_at] = {
+        "published_at": snapshot.published_at,
+        "k24": snapshot.k24,
+        "pt": snapshot.pt,
+        "fetched_at": snapshot.fetched_at,
+    }
+
+    sorted_items = [by_published[key] for key in sorted(by_published.keys())]
+    state["history"] = sorted_items[-MAX_HISTORY:]
+
+
+def get_previous_snapshot(state, published_at):
+    candidates = []
+    for item in state.get("history", []):
+        key = item.get("published_at")
+        if isinstance(key, str) and key < published_at:
+            candidates.append(item)
+
+    if not candidates:
+        return None
+
+    previous = max(candidates, key=lambda item: item["published_at"])
+    return PriceSnapshot(
+        published_at=previous["published_at"],
+        k24=int(previous["k24"]),
+        pt=int(previous["pt"]),
+        fetched_at=str(previous.get("fetched_at", "")),
+    )
+
+
+def get_previous_day_snapshot(state, published_at):
+    current_dt = datetime.strptime(published_at, INTERNAL_TS_FORMAT)
+    current_date = current_dt.date()
+
+    candidates = []
+    for item in state.get("history", []):
+        key = item.get("published_at")
+        if not isinstance(key, str):
+            continue
+        try:
+            item_dt = datetime.strptime(key, INTERNAL_TS_FORMAT)
+        except ValueError:
+            continue
+        if item_dt.date() < current_date:
+            candidates.append((item_dt.date(), item))
+
+    if not candidates:
+        return None
+
+    target_date = max(date_key for date_key, _ in candidates)
+    same_day_items = [item for date_key, item in candidates if date_key == target_date]
+    previous = min(same_day_items, key=lambda item: item["published_at"])
+    return PriceSnapshot(
+        published_at=previous["published_at"],
+        k24=int(previous["k24"]),
+        pt=int(previous["pt"]),
+        fetched_at=str(previous.get("fetched_at", "")),
+    )
+
+
+def format_delta(current, previous):
+    if previous is None:
+        return "初回取得"
+    delta = current - previous
+    sign = "+" if delta > 0 else ""
+    return "{0}{1:,}円".format(sign, delta)
+
+
+def format_published_at_display(published_at):
+    dt = datetime.strptime(published_at, INTERNAL_TS_FORMAT)
+    weekday = DISPLAY_WEEKDAYS[dt.weekday()]
+    return dt.strftime("%Y年%m月%d日") + "({0})".format(weekday) + dt.strftime("%H時%M分")
+
+
+def build_message(snapshot, previous_day, price_url):
+    previous_day_k24 = previous_day.k24 if previous_day else None
+    previous_day_pt = previous_day.pt if previous_day else None
+
+    lines = [
+        "【田中貴金属 リサイクル価格】",
+        "発表：{0}".format(format_published_at_display(snapshot.published_at)),
+        "前日比基準：{0}".format(
+            format_published_at_display(previous_day.published_at) if previous_day else "初回取得"
+        ),
+        "",
+        "[金]",
+        "K24特定品：{0:,}円/g".format(snapshot.k24),
+        "前日比：{0}".format(format_delta(snapshot.k24, previous_day_k24)),
+        "",
+        "[プラチナ]",
+        "Pt特定品：{0:,}円/g".format(snapshot.pt),
+        "前日比：{0}".format(format_delta(snapshot.pt, previous_day_pt)),
+    ]
+
+    lines.append("")
+    lines.append("取得元：{0}".format(price_url))
+    return "\n".join(lines)
+
+
+def build_screenshot_api_url(config):
+    params = {
+        "url": config["price_url"],
+        "access_key": config["screenshotone_access_key"],
+        "selector": config["screenshot_selector"],
+        "selector_algorithm": "clip",
+        "selector_scroll_into_view": "true",
+        "wait_for_selector": config["screenshot_wait_for_selector"],
+        "wait_for_selector_algorithm": "at_least_one",
+        "error_on_selector_not_found": "true",
+        "block_ads": "true",
+        "format": "png",
+        "viewport_width": "1440",
+        "viewport_height": "4000",
+        "device_scale_factor": "1",
+    }
+    if config.get("screenshot_hide_selectors"):
+        params["hide_selectors"] = config["screenshot_hide_selectors"]
+    return "{0}?{1}".format(config["screenshot_api_url"], urlencode(params, doseq=True))
+
+
+def fetch_section_screenshot_bytes(config):
+    screenshot_url = build_screenshot_api_url(config)
+    request = Request(
+        screenshot_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; retanaka-xserver-bot/1.0)",
+            "Accept": "image/png,image/*;q=0.9,*/*;q=0.5",
+        },
+    )
+    context = build_ssl_context()
+    try:
+        with urlopen(request, timeout=60, context=context) as response:
+            content_type = str(response.headers.get("Content-Type", ""))
+            payload = response.read()
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError("スクリーンショットAPIエラー: HTTP {0}: {1}".format(exc.code, body))
+    except URLError as exc:
+        raise RuntimeError("スクリーンショットAPI接続エラー: {0}".format(exc))
+
+    if not payload:
+        raise RuntimeError("スクリーンショットAPIが空レスポンスを返しました")
+
+    if len(payload) > MAX_SCREENSHOT_BYTES:
+        raise RuntimeError("スクリーンショット画像サイズが大きすぎます ({0} bytes)".format(len(payload)))
+
+    if ("image/" not in content_type.lower()) and (not payload.startswith(b"\x89PNG")):
+        snippet = payload[:400].decode("utf-8", errors="replace")
+        raise RuntimeError("スクリーンショットAPIエラー: {0}".format(snippet))
+
+    return payload
+
+
+def save_public_screenshot(config, image_bytes, published_at):
+    public_dir = Path(config["screenshot_public_dir"])
+    public_dir.mkdir(parents=True, exist_ok=True)
+
+    dt = datetime.strptime(published_at, INTERNAL_TS_FORMAT)
+    stamp = dt.strftime("%Y%m%d_%H%M")
+    nonce = os.urandom(5).hex()
+    filename = "retanaka_{0}_{1}.png".format(stamp, nonce)
+    image_path = public_dir / filename
+
+    image_path.write_bytes(image_bytes)
+    try:
+        os.chmod(str(image_path), 0o644)
+    except Exception:
+        pass
+
+    image_url = config["screenshot_public_base_url"].rstrip("/") + "/" + filename
+    return str(image_path), image_url
+
+
+def cleanup_old_screenshots(config):
+    public_dir = Path(config.get("screenshot_public_dir", ""))
+    if not public_dir.exists() or not public_dir.is_dir():
+        return
+
+    retention_seconds = int(config.get("screenshot_retention_hours", DEFAULT_SCREENSHOT_RETENTION_HOURS)) * 3600
+    deadline = time_module.time() - retention_seconds
+
+    for entry in public_dir.iterdir():
+        if not entry.is_file():
+            continue
+        if not entry.name.startswith("retanaka_") or not entry.name.endswith(".png"):
+            continue
+
+        try:
+            if entry.stat().st_mtime < deadline:
+                entry.unlink()
+        except Exception:
+            continue
+
+
+def build_lineworks_payload(text_message, image_url=None, price_url=None):
+    button_url = image_url or price_url or DEFAULT_PRICE_URL
+    button_label = "価格表画像を見る" if image_url else "価格ページを開く"
+    return {
+        "title": "RE:TANAKA価格",
+        "body": {"text": text_message},
+        "button": {
+            "label": button_label,
+            "url": button_url,
+        },
+    }
+
+
+def summarize_screenshot_error_for_user(error_text):
+    lowered = str(error_text).lower()
+    if (
+        "http 401" in lowered
+        or "http 403" in lowered
+        or "access_key" in lowered
+        or "access key" in lowered
+        or "unauthorized" in lowered
+        or "forbidden" in lowered
+        or "token" in lowered
+    ):
+        return "ScreenshotOneのアクセストークン切れ、または無効な可能性があります。"
+    if "http 429" in lowered or "quota" in lowered or "limit" in lowered:
+        return "ScreenshotOneの利用上限に達した可能性があります。"
+    if "selector_not_found" in lowered or ("selector" in lowered and "not found" in lowered):
+        return "価格表エリアの検出に失敗しました。"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "ScreenshotOneの応答がタイムアウトしました。"
+    return "ScreenshotOne障害のため画像を取得できませんでした。"
+
+
+def send_alert_email(config, subject, body):
+    recipient = str(config.get("alert_email", "")).strip()
+    if not recipient:
+        return False
+
+    sendmail_path = str(config.get("sendmail_path", "/usr/sbin/sendmail")).strip() or "/usr/sbin/sendmail"
+    if not os.path.exists(sendmail_path):
+        raise RuntimeError("sendmail not found: {0}".format(sendmail_path))
+
+    message = MIMEText(body, _subtype="plain", _charset="utf-8")
+    message["Subject"] = Header(subject, "utf-8")
+    message["From"] = str(config.get("alert_email_from", "retanaka-bot@localhost")).strip() or "retanaka-bot@localhost"
+    message["To"] = recipient
+
+    process = subprocess.Popen(
+        [sendmail_path, "-t", "-i"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout, stderr = process.communicate(message.as_bytes())
+    if process.returncode != 0:
+        raise RuntimeError(
+            "sendmail failed: exit={0}, stderr={1}".format(
+                process.returncode,
+                stderr.decode("utf-8", errors="replace").strip(),
+            )
+        )
+    return True
+
+
+def ensure_error_alert_dates(state):
+    alert_dates = state.get("error_alert_dates")
+    if not isinstance(alert_dates, dict):
+        alert_dates = {}
+        state["error_alert_dates"] = alert_dates
+    return alert_dates
+
+
+def was_error_alert_sent_today(state, alert_key, today_key):
+    alert_dates = state.get("error_alert_dates")
+    if not isinstance(alert_dates, dict):
+        return False
+    return alert_dates.get(alert_key) == today_key
+
+
+def mark_error_alert_sent(state, alert_key, today_key):
+    alert_dates = ensure_error_alert_dates(state)
+    alert_dates[alert_key] = today_key
+
+
+def maybe_send_error_alert(config, state, alert_key, subject, body_lines):
+    recipient = str(config.get("alert_email", "")).strip()
+    if not recipient:
+        return False
+
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    if was_error_alert_sent_today(state, alert_key, today_key):
+        return False
+
+    send_alert_email(config, subject, "\n".join(body_lines))
+    mark_error_alert_sent(state, alert_key, today_key)
+    return True
+
+
+def maybe_send_test_email(config, state):
+    recipient = str(config.get("alert_email", "")).strip()
+    if not recipient:
+        return False
+    if state.get("test_email_sent_at"):
+        return False
+
+    send_alert_email(
+        config,
+        "RE:TANAKA BOT: テストメール",
+        "\n".join(
+            [
+                "RE:TANAKA BOT の初回テストメールです。",
+                "",
+                "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                "このメールは初回通常実行時に1回だけ送信されます。",
+            ]
+        ),
+    )
+    state["test_email_sent_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return True
+
+
+def send_lineworks_webhook(webhook_url, payload):
+    request = Request(
+        webhook_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "retanaka-lineworks-bot/1.0",
+        },
+        method="POST",
+    )
+
+    context = build_ssl_context()
+    try:
+        with urlopen(request, timeout=30, context=context):
+            return
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError("LINE WORKS Webhookエラー: HTTP {0}: {1}".format(exc.code, body))
+    except URLError as exc:
+        raise RuntimeError("LINE WORKS Webhook接続エラー: {0}".format(exc))
+
+
+def build_ssl_context():
+    try:
+        import certifi  # optional dependency, available in many Python builds
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+def capture_screenshot_if_enabled(config, snapshot):
+    if not config.get("enable_section_screenshot", False):
+        return None, None
+
+    image_bytes = fetch_section_screenshot_bytes(config)
+    image_path, image_url = save_public_screenshot(config, image_bytes, snapshot.published_at)
+    cleanup_old_screenshots(config)
+    return image_path, image_url
+
+
+def main(argv):
+    args = parse_args(argv)
+    alert_config = read_alert_config_only(args.config)
+    state = load_state(alert_config["state_file"])
+
+    try:
+        config = read_config(args.config)
+    except Exception as exc:
+        print("設定読み込みに失敗しました: {0}".format(exc), file=sys.stderr)
+        try:
+            if maybe_send_error_alert(
+                alert_config,
+                state,
+                "config_error",
+                "RE:TANAKA BOT: 設定読み込みエラー",
+                [
+                    "RE:TANAKA BOT の設定読み込みでエラーが発生しました。",
+                    "",
+                    "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    "設定ファイル: {0}".format(args.config),
+                    "エラー: {0}".format(exc),
+                ],
+            ):
+                print("設定読み込みエラー通知メールを送信しました", file=sys.stderr)
+        except Exception as alert_exc:
+            print("設定読み込みエラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+        try:
+            save_state(alert_config["state_file"], state)
+        except Exception:
+            pass
+        return 2
+
+    state = load_state(config["state_file"])
+    if not args.dry_run:
+        try:
+            if maybe_send_test_email(config, state):
+                print("初回テストメールを送信しました", file=sys.stderr)
+                save_state(config["state_file"], state)
+        except Exception as exc:
+            print("初回テストメール送信に失敗しました: {0}".format(exc), file=sys.stderr)
+
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    if not args.dry_run and state.get("last_attempt_date") == today_key and not args.force_send:
+        print("本日は既に送信試行済みのため送信をスキップしました")
+        return 0
+
+    try:
+        html = fetch_html(config["price_url"])
+        current = parse_snapshot(html)
+    except Exception as exc:
+        print("価格取得に失敗しました: {0}".format(exc), file=sys.stderr)
+        try:
+            if maybe_send_error_alert(
+                config,
+                state,
+                "price_fetch_error",
+                "RE:TANAKA BOT: 価格取得エラー",
+                [
+                    "RE:TANAKA BOT の価格取得でエラーが発生しました。",
+                    "",
+                    "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    "取得元: {0}".format(config["price_url"]),
+                    "エラー: {0}".format(exc),
+                ],
+            ):
+                print("価格取得エラー通知メールを送信しました", file=sys.stderr)
+        except Exception as alert_exc:
+            print("価格取得エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+        save_state(config["state_file"], state)
+        return 1
+
+    previous_day = get_previous_day_snapshot(state, current.published_at)
+    message = build_message(current, previous_day, config["price_url"])
+    published_date_key = datetime.strptime(current.published_at, INTERNAL_TS_FORMAT).strftime("%Y-%m-%d")
+
+    upsert_history(state, current)
+
+    screenshot_url = None
+    screenshot_path = None
+    screenshot_error = None
+
+    if args.dry_run:
+        print(message)
+        last_sent = state.get("last_sent_published_at")
+        if published_date_key != today_key:
+            print("通常実行時はスキップ対象: 発表日が本日ではない")
+        if last_sent == current.published_at:
+            print("通常実行時はスキップ対象: 同一発表時刻")
+        if state.get("last_attempt_date") == today_key:
+            print("通常実行時はスキップ対象: 本日は既に送信試行済み")
+        if config.get("enable_section_screenshot", False):
+            try:
+                screenshot_path, screenshot_url = capture_screenshot_if_enabled(config, current)
+                print("スクリーンショットURL: {0}".format(screenshot_url))
+            except Exception as exc:
+                screenshot_error = str(exc)
+                print("スクリーンショット取得に失敗: {0}".format(screenshot_error), file=sys.stderr)
+                print(
+                    "画像なし理由: {0}".format(summarize_screenshot_error_for_user(screenshot_error)),
+                    file=sys.stderr,
+                )
+
+        save_state(config["state_file"], state)
+        if screenshot_error and config.get("require_screenshot", True):
+            return 1
+        return 0
+
+    last_sent = state.get("last_sent_published_at")
+    if published_date_key != today_key and not args.force_send:
+        print("発表日が本日ではないため送信をスキップしました")
+        save_state(config["state_file"], state)
+        return 0
+    if state.get("last_attempt_date") == today_key and not args.force_send:
+        print("本日は既に送信試行済みのため送信をスキップしました")
+        save_state(config["state_file"], state)
+        return 0
+    if last_sent == current.published_at and not args.force_send:
+        print(
+            "同一発表時刻({0})のため送信をスキップしました".format(
+                format_published_at_display(current.published_at)
+            )
+        )
+        save_state(config["state_file"], state)
+        return 0
+
+    if config.get("enable_section_screenshot", False):
+        try:
+            screenshot_path, screenshot_url = capture_screenshot_if_enabled(config, current)
+        except Exception as exc:
+            screenshot_error = str(exc)
+            if config.get("require_screenshot", True):
+                print("スクリーンショット取得に失敗しました: {0}".format(screenshot_error), file=sys.stderr)
+                try:
+                    if maybe_send_error_alert(
+                        config,
+                        state,
+                        "screenshot_error",
+                        "RE:TANAKA BOT: スクリーンショット取得エラー",
+                        [
+                            "RE:TANAKA BOT のスクリーンショット取得でエラーが発生しました。",
+                            "",
+                            "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                            "対象発表時刻: {0}".format(current.published_at),
+                            "エラー: {0}".format(screenshot_error),
+                        ],
+                    ):
+                        print("スクリーンショット取得エラー通知メールを送信しました", file=sys.stderr)
+                except Exception as alert_exc:
+                    print(
+                        "スクリーンショット取得エラー通知メール送信に失敗しました: {0}".format(alert_exc),
+                        file=sys.stderr,
+                    )
+                save_state(config["state_file"], state)
+                return 1
+
+    if screenshot_error:
+        message = (
+            message
+            + "\n※画像なし: ScreenshotOne障害のため、テキストのみ送信しました。"
+            + "\n※理由: {0}".format(summarize_screenshot_error_for_user(screenshot_error))
+        )
+        try:
+            if maybe_send_error_alert(
+                config,
+                state,
+                "screenshot_error",
+                "RE:TANAKA BOT: スクリーンショット取得エラー",
+                [
+                    "RE:TANAKA BOT のスクリーンショット取得でエラーが発生しました。",
+                    "",
+                    "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    "対象発表時刻: {0}".format(current.published_at),
+                    "エラー: {0}".format(screenshot_error),
+                ],
+            ):
+                print("スクリーンショット取得エラー通知メールを送信しました", file=sys.stderr)
+        except Exception as alert_exc:
+            print("スクリーンショット取得エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+
+    payload = build_lineworks_payload(message, screenshot_url, config["price_url"])
+    state["last_attempt_date"] = today_key
+
+    try:
+        send_lineworks_webhook(config["lineworks_webhook_url"], payload)
+    except Exception as exc:
+        print("LINE WORKS送信に失敗しました: {0}".format(exc), file=sys.stderr)
+        error_text = str(exc)
+        try:
+            if maybe_send_error_alert(
+                config,
+                state,
+                "lineworks_send_error",
+                "RE:TANAKA BOT: LINE WORKS送信エラー",
+                [
+                    "RE:TANAKA BOT の LINE WORKS Incoming Webhook送信でエラーが発生しました。",
+                    "",
+                    "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                    "対象発表時刻: {0}".format(current.published_at),
+                    "エラー: {0}".format(error_text),
+                ],
+            ):
+                print("LINE WORKS送信エラー通知メールを送信しました", file=sys.stderr)
+        except Exception as alert_exc:
+            print("LINE WORKS送信エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+        save_state(config["state_file"], state)
+        return 1
+
+    state["last_sent_published_at"] = current.published_at
+    save_state(config["state_file"], state)
+
+    # Optional hard-delete timer for privacy-first operations.
+    delete_after_seconds = int(config.get("screenshot_delete_after_seconds", 0))
+    if screenshot_path and delete_after_seconds > 0:
+        try:
+            time_module.sleep(delete_after_seconds)
+            path_obj = Path(screenshot_path)
+            if path_obj.exists():
+                path_obj.unlink()
+                print("スクリーンショット削除完了: {0}".format(screenshot_path))
+        except Exception as exc:
+            print("スクリーンショット削除に失敗: {0}".format(exc), file=sys.stderr)
+            try:
+                if maybe_send_error_alert(
+                    config,
+                    state,
+                    "screenshot_cleanup_error",
+                    "RE:TANAKA BOT: スクリーンショット削除エラー",
+                    [
+                        "RE:TANAKA BOT のスクリーンショット削除でエラーが発生しました。",
+                        "",
+                        "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        "対象ファイル: {0}".format(screenshot_path),
+                        "エラー: {0}".format(exc),
+                    ],
+                ):
+                    print("スクリーンショット削除エラー通知メールを送信しました", file=sys.stderr)
+                    save_state(config["state_file"], state)
+            except Exception as alert_exc:
+                print("スクリーンショット削除エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+
+    if screenshot_url:
+        print("送信完了(画像リンク+テキスト): {0}".format(format_published_at_display(current.published_at)))
+    else:
+        print("送信完了(テキスト): {0}".format(format_published_at_display(current.published_at)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

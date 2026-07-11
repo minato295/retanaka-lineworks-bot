@@ -1,0 +1,22 @@
+{
+  "lineworks_webhook_url": "https://webhook.worksmobile.com/message/YOUR_WEBHOOK_ID",
+  "alert_email": "YOUR_ALERT_EMAIL",
+  "alert_email_from": "retanaka-bot@localhost",
+  "sendmail_path": "/usr/sbin/sendmail",
+  "price_url": "https://gold.tanaka.co.jp/retanaka/price/",
+  "state_file": "./storage/retanaka_price_state.json",
+  "timezone": "Asia/Tokyo",
+
+  "enable_section_screenshot": true,
+  "require_screenshot": false,
+  "screenshotone_access_key": "YOUR_SCREENSHOTONE_ACCESS_KEY",
+  "screenshot_public_dir": "/home/YOUR_SERVER_ID/YOUR_DOMAIN/public_html/retanaka-bot-images",
+  "screenshot_public_base_url": "https://YOUR_DOMAIN/retanaka-bot-images",
+  "screenshot_selector": "#contents article > section",
+  "screenshot_wait_for_selector": "#price_tables",
+  "screenshot_hide_selectors": [
+    "#contents article > section > p.buttons"
+  ],
+  "screenshot_retention_hours": 72,
+  "screenshot_delete_after_seconds": 0
+}
