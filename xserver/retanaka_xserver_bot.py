@@ -772,9 +772,13 @@ def cleanup_old_screenshots(config):
 def build_lineworks_payload(text_message, image_url=None, price_url=None):
     button_url = image_url or price_url or DEFAULT_PRICE_URL
     button_label = "価格表画像を見る" if image_url else "価格ページを開く"
+    body_text = text_message
+    heading = "【田中貴金属 リサイクル価格】"
+    if body_text.startswith(heading):
+        body_text = body_text[len(heading) :].lstrip("\r\n")
     return {
         "title": "RE:TANAKA価格",
-        "body": {"text": text_message},
+        "body": {"text": body_text},
         "button": {
             "label": button_label,
             "url": button_url,

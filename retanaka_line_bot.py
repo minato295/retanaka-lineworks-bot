@@ -333,9 +333,13 @@ def send_line_message(channel_access_token: str, group_id: str, message: str) ->
 
 
 def build_lineworks_payload(message: str, button_url: str = PRICE_URL) -> dict[str, Any]:
+    body_text = message
+    heading = "【田中貴金属 リサイクル価格】"
+    if body_text.startswith(heading):
+        body_text = body_text[len(heading) :].lstrip("\r\n")
     return {
         "title": "RE:TANAKA価格",
-        "body": {"text": message},
+        "body": {"text": body_text},
         "button": {
             "label": "価格ページを開く",
             "url": button_url,

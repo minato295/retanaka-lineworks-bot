@@ -309,6 +309,17 @@ class RetanakaXserverBotTests(unittest.TestCase):
             {"label": "価格表画像を見る", "url": "https://example.com/price.png"},
         )
 
+    def test_lineworks_payload_removes_duplicate_body_heading(self) -> None:
+        bot = load_module()
+        payload = bot.build_lineworks_payload(
+            "【田中貴金属 リサイクル価格】\n発表：2026年07月11日",
+            None,
+            "https://example.com/source",
+        )
+
+        self.assertEqual(payload["title"], "RE:TANAKA価格")
+        self.assertEqual(payload["body"]["text"], "発表：2026年07月11日")
+
     def test_read_config_requires_lineworks_webhook(self) -> None:
         bot = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:

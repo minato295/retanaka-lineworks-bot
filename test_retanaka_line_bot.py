@@ -145,6 +145,16 @@ class RetanakaLineBotTests(unittest.TestCase):
             {"label": "価格ページを開く", "url": "https://example.com/price"},
         )
 
+    def test_lineworks_payload_removes_duplicate_body_heading(self) -> None:
+        bot = load_module()
+        payload = bot.build_lineworks_payload(
+            "【田中貴金属 リサイクル価格】\n発表: 2026年07月11日",
+            "https://example.com/price",
+        )
+
+        self.assertEqual(payload["title"], "RE:TANAKA価格")
+        self.assertEqual(payload["body"]["text"], "発表: 2026年07月11日")
+
     def test_build_line_messages_contains_text_and_image(self) -> None:
         bot = load_module()
 
