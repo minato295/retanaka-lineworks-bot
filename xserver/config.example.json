@@ -1,21 +1,25 @@
 {
-  "lineworks_webhook_url": "https://webhook.worksmobile.com/message/YOUR_WEBHOOK_ID",
+  "line_channel_access_token": "YOUR_LINE_CHANNEL_ACCESS_TOKEN",
+  "line_group_id": "YOUR_LINE_GROUP_ID",
+  "lineworks_webhook_url": "YOUR_LINEWORKS_WEBHOOK_URL",
   "alert_email": "YOUR_ALERT_EMAIL",
-  "alert_email_from": "retanaka-bot@localhost",
+  "alert_email_from": "YOUR_ALERT_EMAIL_FROM",
   "sendmail_path": "/usr/sbin/sendmail",
-  "price_url": "https://gold.tanaka.co.jp/retanaka/price/",
-  "state_file": "./storage/retanaka_price_state.json",
+  "price_url": "YOUR_PRICE_URL",
+  "state_file": "/home/YOUR_ACCOUNT/ops/retanaka-bot/storage/retanaka_price_state.json",
+  "lock_file": "/home/YOUR_ACCOUNT/ops/retanaka-bot/storage/retanaka_price.lock",
   "timezone": "Asia/Tokyo",
 
   "enable_section_screenshot": true,
-  "require_screenshot": false,
+  "require_screenshot": true,
+  "screenshot_api_url": "YOUR_SCREENSHOT_API_URL",
   "screenshotone_access_key": "YOUR_SCREENSHOTONE_ACCESS_KEY",
-  "screenshot_public_dir": "/home/YOUR_SERVER_ID/YOUR_DOMAIN/public_html/retanaka-bot-images",
-  "screenshot_public_base_url": "https://YOUR_DOMAIN/retanaka-bot-images",
-  "screenshot_selector": "#contents article > section",
-  "screenshot_wait_for_selector": "#price_tables",
+  "screenshot_public_dir": "/home/YOUR_ACCOUNT/YOUR_DOMAIN/public_html/retanaka-bot-images",
+  "screenshot_public_base_url": "YOUR_PUBLIC_IMAGE_BASE_URL",
+  "screenshot_selector": "YOUR_SCREENSHOT_SELECTOR",
+  "screenshot_wait_for_selector": "YOUR_SCREENSHOT_WAIT_FOR_SELECTOR",
   "screenshot_hide_selectors": [
-    "#contents article > section > p.buttons"
+    "YOUR_SCREENSHOT_HIDE_SELECTOR"
   ],
   "screenshot_retention_hours": 72,
   "screenshot_delete_after_seconds": 0

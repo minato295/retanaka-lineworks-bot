@@ -8,13 +8,16 @@ Python 3.6+ (Xserver shared hosting compatible) / standard library only.
 from __future__ import print_function
 
 import argparse
+import fcntl
 import json
 import os
 import re
 import ssl
 import subprocess
 import sys
+import tempfile
 import time as time_module
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.text import MIMEText
@@ -26,6 +29,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 DEFAULT_PRICE_URL = "https://gold.tanaka.co.jp/retanaka/price/"
+LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 LINEWORKS_WEBHOOK_PREFIX = "https://webhook.worksmobile.com/message/"
 SCREENSHOT_API_URL = "https://api.screenshotone.com/take"
 DEFAULT_SECTION_SELECTOR = "#contents article > section"
@@ -47,14 +51,24 @@ class PriceSnapshot(NamedTuple):
     published_at: str
     k24: int
     pt: int
+    silver_999: Optional[int]
     fetched_at: str
 
 
 def make_empty_state():
     return {
+        "schema_version": 2,
         "history": [],
-        "last_sent_published_at": None,
-        "last_attempt_date": None,
+        "last_observed_published_at": None,
+        "deliveries": {
+            "line": {
+                "last_sent_published_at": None,
+                "last_sent_date": None,
+            },
+            "lineworks": {
+                "last_sent_published_at": None,
+            },
+        },
         "error_alert_dates": {},
         "test_email_sent_at": None,
     }
@@ -69,6 +83,7 @@ def parse_args(argv):
     )
     parser.add_argument("--dry-run", action="store_true", help="LINE WORKS送信せず通知内容のみ出力")
     parser.add_argument("--force-send", action="store_true", help="同一発表時刻でも送信")
+    parser.add_argument("--test-lineworks-only", action="store_true", help="状態を変更せずLINE WORKSだけに送信")
     return parser.parse_args(argv)
 
 
@@ -149,6 +164,13 @@ def read_config(path):
     if not config["lineworks_webhook_url"].startswith(LINEWORKS_WEBHOOK_PREFIX):
         raise RuntimeError("lineworks_webhook_url must start with {0}".format(LINEWORKS_WEBHOOK_PREFIX))
 
+    line_token = str(config.get("line_channel_access_token", "")).strip()
+    line_group_id = str(config.get("line_group_id", "")).strip()
+    if bool(line_token) != bool(line_group_id):
+        raise RuntimeError("line_channel_access_token and line_group_id must be configured together")
+    config["line_channel_access_token"] = line_token
+    config["line_group_id"] = line_group_id
+
     config["price_url"] = str(config.get("price_url", DEFAULT_PRICE_URL)).strip() or DEFAULT_PRICE_URL
     config["timezone"] = str(config.get("timezone", "Asia/Tokyo")).strip() or "Asia/Tokyo"
     config["alert_email"] = str(config.get("alert_email", "")).strip()
@@ -159,6 +181,11 @@ def read_config(path):
 
     default_state = config_dir / "storage" / "retanaka_price_state.json"
     config["state_file"] = normalize_path(config_dir, config.get("state_file"), str(default_state))
+    config["lock_file"] = normalize_path(
+        config_dir,
+        config.get("lock_file"),
+        str(config_dir / "storage" / "retanaka_price.lock"),
+    )
 
     # Screenshot settings
     config["enable_section_screenshot"] = parse_bool(config.get("enable_section_screenshot", False), False)
@@ -269,8 +296,51 @@ def parse_snapshot(html):
         published_at=extract_published_at(text),
         k24=extract_price(text, "K24特定品"),
         pt=extract_price(text, "Pt特定品"),
+        silver_999=extract_silver_999_price(html),
         fetched_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
+
+
+def extract_silver_999_price(html):
+    silver_section = re.search(
+        r'<section\b[^>]*\bid=["\']ag_price["\'][^>]*>(.*?)</section>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if silver_section:
+        section_text = html_to_text(silver_section.group(0))
+        match = re.search(
+            r"1000\s*[（(]\s*999\s*[）)]\s*[¥￥]?\s*([0-9][0-9,]*)",
+            section_text,
+        )
+        if match:
+            return int(match.group(1).replace(",", ""))
+
+    tables = re.finditer(
+        r"<table\b(?P<attributes>[^>]*)>(?P<contents>.*?)</table>",
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in tables:
+        table = match.group(0)
+        table_text = html_to_text(table)
+        attributes = match.group("attributes").lower()
+        if "silver" not in attributes and "銀製品" not in table_text:
+            continue
+        try:
+            return extract_price(table_text, "1000（999）")
+        except RuntimeError:
+            try:
+                return extract_price(table_text, "1000(999)")
+            except RuntimeError:
+                try:
+                    return extract_price(table_text, "銀(999)")
+                except RuntimeError:
+                    try:
+                        return extract_price(table_text, "銀999")
+                    except RuntimeError:
+                        continue
+    return None
 
 
 def load_state(path):
@@ -283,7 +353,14 @@ def load_state(path):
     except ValueError:
         return make_empty_state()
 
-    history = data.get("history") if isinstance(data, dict) else []
+    return migrate_state(data)
+
+
+def migrate_state(data):
+    if not isinstance(data, dict):
+        return make_empty_state()
+
+    history = data.get("history")
     if not isinstance(history, list):
         history = []
 
@@ -303,24 +380,44 @@ def load_state(path):
                 "published_at": published_at,
                 "k24": k24,
                 "pt": pt,
+                "silver_999": item.get("silver_999") if isinstance(item.get("silver_999"), int) else None,
                 "fetched_at": str(item.get("fetched_at", "")),
             }
         )
 
-    last_sent = data.get("last_sent_published_at") if isinstance(data, dict) else None
-    if not isinstance(last_sent, str):
-        last_sent = None
-    last_attempt_date = data.get("last_attempt_date") if isinstance(data, dict) else None
-    if not isinstance(last_attempt_date, str):
-        last_attempt_date = None
-    raw_error_alert_dates = data.get("error_alert_dates") if isinstance(data, dict) else {}
+    deliveries = data.get("deliveries")
+    if not isinstance(deliveries, dict):
+        deliveries = {}
+    raw_line = deliveries.get("line")
+    if not isinstance(raw_line, dict):
+        raw_line = {}
+    raw_lineworks = deliveries.get("lineworks")
+    if not isinstance(raw_lineworks, dict):
+        raw_lineworks = {}
+
+    line_last_sent_date = raw_line.get("last_sent_date", data.get("line_last_sent_date"))
+    if not isinstance(line_last_sent_date, str):
+        line_last_sent_date = None
+    line_last_sent_published_at = raw_line.get("last_sent_published_at")
+    if not isinstance(line_last_sent_published_at, str):
+        line_last_sent_published_at = None
+    lineworks_last_sent_published_at = raw_lineworks.get(
+        "last_sent_published_at", data.get("lineworks_last_sent_published_at")
+    )
+    if not isinstance(lineworks_last_sent_published_at, str):
+        legacy_last_sent = data.get("last_sent_published_at")
+        lineworks_last_sent_published_at = legacy_last_sent if isinstance(legacy_last_sent, str) else None
+    last_observed_published_at = data.get("last_observed_published_at")
+    if not isinstance(last_observed_published_at, str):
+        last_observed_published_at = None
+    raw_error_alert_dates = data.get("error_alert_dates")
     if not isinstance(raw_error_alert_dates, dict):
         raw_error_alert_dates = {}
     error_alert_dates = {}
     for key, value in raw_error_alert_dates.items():
         if isinstance(key, str) and isinstance(value, str):
             error_alert_dates[key] = value
-    test_email_sent_at = data.get("test_email_sent_at") if isinstance(data, dict) else None
+    test_email_sent_at = data.get("test_email_sent_at")
     if not isinstance(test_email_sent_at, str):
         test_email_sent_at = None
 
@@ -328,8 +425,14 @@ def load_state(path):
     state.update(
         {
             "history": normalized,
-            "last_sent_published_at": last_sent,
-            "last_attempt_date": last_attempt_date,
+            "last_observed_published_at": last_observed_published_at,
+            "deliveries": {
+                "line": {
+                    "last_sent_published_at": line_last_sent_published_at,
+                    "last_sent_date": line_last_sent_date,
+                },
+                "lineworks": {"last_sent_published_at": lineworks_last_sent_published_at},
+            },
             "error_alert_dates": error_alert_dates,
             "test_email_sent_at": test_email_sent_at,
         }
@@ -337,16 +440,81 @@ def load_state(path):
     return state
 
 
-def save_state(path, state):
-    state_path = Path(path)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = Path(str(state_path) + ".tmp")
-    tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(state_path)
+def ensure_private_storage_directory(directory):
+    directory.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(str(state_path), 0o600)
+        os.chmod(str(directory), 0o700)
     except Exception:
         pass
+
+
+def fsync_directory(directory):
+    try:
+        directory_fd = os.open(str(directory), os.O_RDONLY)
+    except Exception:
+        return
+    try:
+        os.fsync(directory_fd)
+    except Exception:
+        pass
+    finally:
+        os.close(directory_fd)
+
+
+def save_state(path, state):
+    state_path = Path(path)
+    ensure_private_storage_directory(state_path.parent)
+    fd = None
+    tmp_path = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".{0}.".format(state_path.name), suffix=".tmp", dir=str(state_path.parent)
+        )
+        tmp_path = Path(tmp_name)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(tmp_path), str(state_path))
+        tmp_path = None
+        try:
+            os.chmod(str(state_path), 0o600)
+        except Exception:
+            pass
+        fsync_directory(state_path.parent)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+
+
+@contextmanager
+def acquire_process_lock(path):
+    lock_path = Path(path)
+    ensure_private_storage_directory(lock_path.parent)
+    handle = lock_path.open("a+")
+    try:
+        try:
+            os.chmod(str(lock_path), 0o600)
+        except Exception:
+            pass
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (IOError, OSError):
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def upsert_history(state, snapshot):
@@ -360,6 +528,7 @@ def upsert_history(state, snapshot):
         "published_at": snapshot.published_at,
         "k24": snapshot.k24,
         "pt": snapshot.pt,
+        "silver_999": snapshot.silver_999,
         "fetched_at": snapshot.fetched_at,
     }
 
@@ -382,6 +551,7 @@ def get_previous_snapshot(state, published_at):
         published_at=previous["published_at"],
         k24=int(previous["k24"]),
         pt=int(previous["pt"]),
+        silver_999=previous.get("silver_999") if isinstance(previous.get("silver_999"), int) else None,
         fetched_at=str(previous.get("fetched_at", "")),
     )
 
@@ -412,6 +582,7 @@ def get_previous_day_snapshot(state, published_at):
         published_at=previous["published_at"],
         k24=int(previous["k24"]),
         pt=int(previous["pt"]),
+        silver_999=previous.get("silver_999") if isinstance(previous.get("silver_999"), int) else None,
         fetched_at=str(previous.get("fetched_at", "")),
     )
 
@@ -430,9 +601,33 @@ def format_published_at_display(published_at):
     return dt.strftime("%Y年%m月%d日") + "({0})".format(weekday) + dt.strftime("%H時%M分")
 
 
+def should_deliver_line(state, snapshot, today_key):
+    line_delivery = state.get("deliveries", {}).get("line", {})
+    return (
+        snapshot.published_at.startswith(today_key)
+        and line_delivery.get("last_sent_date") != today_key
+        and line_delivery.get("last_sent_published_at") != snapshot.published_at
+    )
+
+
+def should_deliver_lineworks(state, snapshot):
+    lineworks_delivery = state.get("deliveries", {}).get("lineworks", {})
+    return lineworks_delivery.get("last_sent_published_at") != snapshot.published_at
+
+
+def is_new_observation(state, snapshot):
+    last_observed = state.get("last_observed_published_at")
+    return not isinstance(last_observed, str) or snapshot.published_at > last_observed
+
+
+def is_equal_observation(state, snapshot):
+    return state.get("last_observed_published_at") == snapshot.published_at
+
+
 def build_message(snapshot, previous_day, price_url):
     previous_day_k24 = previous_day.k24 if previous_day else None
     previous_day_pt = previous_day.pt if previous_day else None
+    previous_day_silver = previous_day.silver_999 if previous_day else None
 
     lines = [
         "【田中貴金属 リサイクル価格】",
@@ -449,6 +644,16 @@ def build_message(snapshot, previous_day, price_url):
         "Pt特定品：{0:,}円/g".format(snapshot.pt),
         "前日比：{0}".format(format_delta(snapshot.pt, previous_day_pt)),
     ]
+
+    if snapshot.silver_999 is not None:
+        lines.extend(
+            [
+                "",
+                "[銀]",
+                "銀(999)：{0:,}円/g".format(snapshot.silver_999),
+                "前日比：{0}".format(format_delta(snapshot.silver_999, previous_day_silver)),
+            ]
+        )
 
     lines.append("")
     lines.append("取得元：{0}".format(price_url))
@@ -529,6 +734,20 @@ def save_public_screenshot(config, image_bytes, published_at):
     return str(image_path), image_url
 
 
+def find_public_screenshot(config, published_at):
+    public_dir = Path(config["screenshot_public_dir"])
+    if not public_dir.exists() or not public_dir.is_dir():
+        return None, None
+
+    stamp = datetime.strptime(published_at, INTERNAL_TS_FORMAT).strftime("%Y%m%d_%H%M")
+    candidates = sorted(public_dir.glob("retanaka_{0}_*.png".format(stamp)))
+    for image_path in candidates:
+        if image_path.is_file():
+            image_url = config["screenshot_public_base_url"].rstrip("/") + "/" + image_path.name
+            return str(image_path), image_url
+    return None, None
+
+
 def cleanup_old_screenshots(config):
     public_dir = Path(config.get("screenshot_public_dir", ""))
     if not public_dir.exists() or not public_dir.is_dir():
@@ -561,6 +780,19 @@ def build_lineworks_payload(text_message, image_url=None, price_url=None):
             "url": button_url,
         },
     }
+
+
+def build_line_messages(text_message, image_url=None):
+    messages = [{"type": "text", "text": text_message}]
+    if image_url:
+        messages.append(
+            {
+                "type": "image",
+                "originalContentUrl": image_url,
+                "previewImageUrl": image_url,
+            }
+        )
+    return messages
 
 
 def summarize_screenshot_error_for_user(error_text):
@@ -672,6 +904,39 @@ def maybe_send_test_email(config, state):
     return True
 
 
+def is_line_limit_error(error):
+    message = str(error).lower()
+    return "http 429" in message or "quota" in message or "monthly" in message or "limit" in message
+
+
+def maybe_send_delivery_error_alert(config, state, channel, error, published_at):
+    if channel == "line" and is_line_limit_error(error):
+        alert_key = "line_limit_error"
+        subject = "RE:TANAKA BOT: LINE送信上限エラー"
+    elif channel == "line":
+        alert_key = "line_delivery_error"
+        subject = "RE:TANAKA BOT: LINE送信エラー"
+    else:
+        alert_key = "lineworks_delivery_error"
+        subject = "RE:TANAKA BOT: LINE WORKS送信エラー"
+
+    return maybe_send_error_alert(
+        config,
+        state,
+        alert_key,
+        subject,
+        [
+            "RE:TANAKA BOT の{0}送信でエラーが発生しました。".format(
+                "LINE" if channel == "line" else "LINE WORKS"
+            ),
+            "",
+            "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "対象発表時刻: {0}".format(published_at),
+            "エラー: {0}".format(error),
+        ],
+    )
+
+
 def send_lineworks_webhook(webhook_url, payload):
     request = Request(
         webhook_url,
@@ -694,6 +959,28 @@ def send_lineworks_webhook(webhook_url, payload):
         raise RuntimeError("LINE WORKS Webhook接続エラー: {0}".format(exc))
 
 
+def send_line_messages(token, group_id, messages):
+    payload = {"to": group_id, "messages": messages}
+    request = Request(
+        LINE_PUSH_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer {0}".format(token),
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    context = build_ssl_context()
+    try:
+        with urlopen(request, timeout=30, context=context):
+            return
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError("LINE API エラー: HTTP {0}: {1}".format(exc.code, body))
+    except URLError as exc:
+        raise RuntimeError("LINE API 接続エラー: {0}".format(exc))
+
+
 def build_ssl_context():
     try:
         import certifi  # optional dependency, available in many Python builds
@@ -707,19 +994,23 @@ def capture_screenshot_if_enabled(config, snapshot):
     if not config.get("enable_section_screenshot", False):
         return None, None
 
+    cleanup_old_screenshots(config)
+    image_path, image_url = find_public_screenshot(config, snapshot.published_at)
+    if image_path:
+        return image_path, image_url
+
     image_bytes = fetch_section_screenshot_bytes(config)
     image_path, image_url = save_public_screenshot(config, image_bytes, snapshot.published_at)
-    cleanup_old_screenshots(config)
     return image_path, image_url
 
 
-def main(argv):
+def _run(argv, preloaded_config=None):
     args = parse_args(argv)
     alert_config = read_alert_config_only(args.config)
     state = load_state(alert_config["state_file"])
 
     try:
-        config = read_config(args.config)
+        config = preloaded_config if preloaded_config is not None else read_config(args.config)
     except Exception as exc:
         print("設定読み込みに失敗しました: {0}".format(exc), file=sys.stderr)
         try:
@@ -746,7 +1037,7 @@ def main(argv):
         return 2
 
     state = load_state(config["state_file"])
-    if not args.dry_run:
+    if not args.dry_run and not args.test_lineworks_only:
         try:
             if maybe_send_test_email(config, state):
                 print("初回テストメールを送信しました", file=sys.stderr)
@@ -755,40 +1046,86 @@ def main(argv):
             print("初回テストメール送信に失敗しました: {0}".format(exc), file=sys.stderr)
 
     today_key = datetime.now().strftime("%Y-%m-%d")
-    if not args.dry_run and state.get("last_attempt_date") == today_key and not args.force_send:
-        print("本日は既に送信試行済みのため送信をスキップしました")
-        return 0
 
     try:
         html = fetch_html(config["price_url"])
         current = parse_snapshot(html)
     except Exception as exc:
         print("価格取得に失敗しました: {0}".format(exc), file=sys.stderr)
-        try:
-            if maybe_send_error_alert(
-                config,
-                state,
-                "price_fetch_error",
-                "RE:TANAKA BOT: 価格取得エラー",
-                [
-                    "RE:TANAKA BOT の価格取得でエラーが発生しました。",
-                    "",
-                    "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                    "取得元: {0}".format(config["price_url"]),
-                    "エラー: {0}".format(exc),
-                ],
-            ):
-                print("価格取得エラー通知メールを送信しました", file=sys.stderr)
-        except Exception as alert_exc:
-            print("価格取得エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
-        save_state(config["state_file"], state)
+        if not args.test_lineworks_only:
+            try:
+                if maybe_send_error_alert(
+                    config,
+                    state,
+                    "price_fetch_error",
+                    "RE:TANAKA BOT: 価格取得エラー",
+                    [
+                        "RE:TANAKA BOT の価格取得でエラーが発生しました。",
+                        "",
+                        "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                        "取得元: {0}".format(config["price_url"]),
+                        "エラー: {0}".format(exc),
+                    ],
+                ):
+                    print("価格取得エラー通知メールを送信しました", file=sys.stderr)
+            except Exception as alert_exc:
+                print("価格取得エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+            save_state(config["state_file"], state)
         return 1
 
     previous_day = get_previous_day_snapshot(state, current.published_at)
     message = build_message(current, previous_day, config["price_url"])
     published_date_key = datetime.strptime(current.published_at, INTERNAL_TS_FORMAT).strftime("%Y-%m-%d")
 
-    upsert_history(state, current)
+    if args.test_lineworks_only:
+        screenshot_url = None
+        if config.get("enable_section_screenshot", False):
+            try:
+                _, screenshot_url = capture_screenshot_if_enabled(config, current)
+            except Exception as exc:
+                if config.get("require_screenshot", True):
+                    print("LINE WORKS限定テスト用スクリーンショット取得に失敗しました: {0}".format(exc), file=sys.stderr)
+                    return 1
+                print("LINE WORKS限定テスト用スクリーンショット取得に失敗しました: {0}".format(exc), file=sys.stderr)
+        try:
+            send_lineworks_webhook(
+                config["lineworks_webhook_url"],
+                build_lineworks_payload(message, screenshot_url, config["price_url"]),
+            )
+        except Exception as exc:
+            print("LINE WORKS限定テスト送信に失敗しました: {0}".format(exc), file=sys.stderr)
+            return 1
+        print("LINE WORKS限定テスト送信完了")
+        return 0
+
+    if not args.force_send:
+        if state.get("last_observed_published_at") is None:
+            upsert_history(state, current)
+            state["last_observed_published_at"] = current.published_at
+            state["deliveries"]["lineworks"]["last_sent_published_at"] = current.published_at
+            if published_date_key == today_key and config.get("line_channel_access_token"):
+                state["deliveries"]["line"]["last_sent_published_at"] = current.published_at
+                state["deliveries"]["line"]["last_sent_date"] = today_key
+            save_state(config["state_file"], state)
+            print("初回観測のため現在の発表を送信せず登録しました")
+            return 0
+        if current.published_at < state["last_observed_published_at"]:
+            print("前回観測より古い発表のため送信をスキップしました")
+            return 0
+
+    observation_is_new = args.force_send or is_new_observation(state, current)
+    observation_is_equal = is_equal_observation(state, current)
+    if observation_is_new:
+        upsert_history(state, current)
+        state["last_observed_published_at"] = current.published_at
+        save_state(config["state_file"], state)
+
+    send_line = bool(config.get("line_channel_access_token")) and (
+        args.force_send or (observation_is_new or observation_is_equal) and should_deliver_line(state, current, today_key)
+    )
+    send_lineworks = args.force_send or (
+        (observation_is_new or observation_is_equal) and should_deliver_lineworks(state, current)
+    )
 
     screenshot_url = None
     screenshot_path = None
@@ -796,13 +1133,10 @@ def main(argv):
 
     if args.dry_run:
         print(message)
-        last_sent = state.get("last_sent_published_at")
-        if published_date_key != today_key:
-            print("通常実行時はスキップ対象: 発表日が本日ではない")
-        if last_sent == current.published_at:
-            print("通常実行時はスキップ対象: 同一発表時刻")
-        if state.get("last_attempt_date") == today_key:
-            print("通常実行時はスキップ対象: 本日は既に送信試行済み")
+        if not send_line:
+            print("通常実行時はLINE送信をスキップします")
+        if not send_lineworks:
+            print("通常実行時はLINE WORKS送信をスキップします")
         if config.get("enable_section_screenshot", False):
             try:
                 screenshot_path, screenshot_url = capture_screenshot_if_enabled(config, current)
@@ -820,21 +1154,8 @@ def main(argv):
             return 1
         return 0
 
-    last_sent = state.get("last_sent_published_at")
-    if published_date_key != today_key and not args.force_send:
-        print("発表日が本日ではないため送信をスキップしました")
-        save_state(config["state_file"], state)
-        return 0
-    if state.get("last_attempt_date") == today_key and not args.force_send:
-        print("本日は既に送信試行済みのため送信をスキップしました")
-        save_state(config["state_file"], state)
-        return 0
-    if last_sent == current.published_at and not args.force_send:
-        print(
-            "同一発表時刻({0})のため送信をスキップしました".format(
-                format_published_at_display(current.published_at)
-            )
-        )
+    if not send_line and not send_lineworks:
+        print("送信対象の新しい発表ではないため送信をスキップしました")
         save_state(config["state_file"], state)
         return 0
 
@@ -892,72 +1213,67 @@ def main(argv):
         except Exception as alert_exc:
             print("スクリーンショット取得エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
 
-    payload = build_lineworks_payload(message, screenshot_url, config["price_url"])
-    state["last_attempt_date"] = today_key
-
-    try:
-        send_lineworks_webhook(config["lineworks_webhook_url"], payload)
-    except Exception as exc:
-        print("LINE WORKS送信に失敗しました: {0}".format(exc), file=sys.stderr)
-        error_text = str(exc)
+    delivery_failed = False
+    if send_line:
         try:
-            if maybe_send_error_alert(
-                config,
-                state,
-                "lineworks_send_error",
-                "RE:TANAKA BOT: LINE WORKS送信エラー",
-                [
-                    "RE:TANAKA BOT の LINE WORKS Incoming Webhook送信でエラーが発生しました。",
-                    "",
-                    "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                    "対象発表時刻: {0}".format(current.published_at),
-                    "エラー: {0}".format(error_text),
-                ],
-            ):
-                print("LINE WORKS送信エラー通知メールを送信しました", file=sys.stderr)
-        except Exception as alert_exc:
-            print("LINE WORKS送信エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
-        save_state(config["state_file"], state)
-        return 1
-
-    state["last_sent_published_at"] = current.published_at
-    save_state(config["state_file"], state)
-
-    # Optional hard-delete timer for privacy-first operations.
-    delete_after_seconds = int(config.get("screenshot_delete_after_seconds", 0))
-    if screenshot_path and delete_after_seconds > 0:
-        try:
-            time_module.sleep(delete_after_seconds)
-            path_obj = Path(screenshot_path)
-            if path_obj.exists():
-                path_obj.unlink()
-                print("スクリーンショット削除完了: {0}".format(screenshot_path))
+            send_line_messages(
+                config["line_channel_access_token"],
+                config["line_group_id"],
+                build_line_messages(message, screenshot_url),
+            )
         except Exception as exc:
-            print("スクリーンショット削除に失敗: {0}".format(exc), file=sys.stderr)
+            delivery_failed = True
+            print("LINE送信に失敗しました: {0}".format(exc), file=sys.stderr)
             try:
-                if maybe_send_error_alert(
-                    config,
-                    state,
-                    "screenshot_cleanup_error",
-                    "RE:TANAKA BOT: スクリーンショット削除エラー",
-                    [
-                        "RE:TANAKA BOT のスクリーンショット削除でエラーが発生しました。",
-                        "",
-                        "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-                        "対象ファイル: {0}".format(screenshot_path),
-                        "エラー: {0}".format(exc),
-                    ],
-                ):
-                    print("スクリーンショット削除エラー通知メールを送信しました", file=sys.stderr)
+                if maybe_send_delivery_error_alert(config, state, "line", exc, current.published_at):
                     save_state(config["state_file"], state)
             except Exception as alert_exc:
-                print("スクリーンショット削除エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+                print("LINE送信エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+        else:
+            state["deliveries"]["line"]["last_sent_published_at"] = current.published_at
+            state["deliveries"]["line"]["last_sent_date"] = published_date_key
+            save_state(config["state_file"], state)
+
+    if send_lineworks:
+        try:
+            send_lineworks_webhook(
+                config["lineworks_webhook_url"],
+                build_lineworks_payload(message, screenshot_url, config["price_url"]),
+            )
+        except Exception as exc:
+            delivery_failed = True
+            print("LINE WORKS送信に失敗しました: {0}".format(exc), file=sys.stderr)
+            try:
+                if maybe_send_delivery_error_alert(config, state, "lineworks", exc, current.published_at):
+                    save_state(config["state_file"], state)
+            except Exception as alert_exc:
+                print("LINE WORKS送信エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
+        else:
+            state["deliveries"]["lineworks"]["last_sent_published_at"] = current.published_at
+            save_state(config["state_file"], state)
+
+    if delivery_failed:
+        return 1
 
     if screenshot_url:
         print("送信完了(画像リンク+テキスト): {0}".format(format_published_at_display(current.published_at)))
     else:
         print("送信完了(テキスト): {0}".format(format_published_at_display(current.published_at)))
     return 0
+
+
+def main(argv):
+    args = parse_args(argv)
+    try:
+        config = read_config(args.config)
+    except Exception:
+        return _run(argv)
+
+    with acquire_process_lock(config["lock_file"]) as acquired:
+        if not acquired:
+            print("別プロセスが実行中のためスキップしました")
+            return 0
+        return _run(argv, preloaded_config=config)
 
 
 if __name__ == "__main__":

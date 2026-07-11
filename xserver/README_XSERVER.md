@@ -1,84 +1,92 @@
 # Xserver運用手順
 
-Xserver共用サーバーのCronからRE:TANAKA価格を毎分確認し、当日の最初の更新をLINE WORKS Incoming Webhookへ1回だけ通知します。
+Xserver共用サーバーのCronからRE:TANAKA価格を毎分確認します。
 
-通知内容:
-
-- K24特定品 / Pt特定品と前回営業日比
-- 発表日時
-- 取得元URL
-- 価格表スクリーンショットへのリンクボタン
-
-Incoming Webhookは画像メッセージを直接送信しないため、スクリーンショットは公開URLへのボタンとして表示します。
+- LINE: 当日の最初の新しい発表を1回だけ通知
+- LINE WORKS: 新しい発表ごとに通知
+- K24特定品、Pt特定品、銀(999)、前回営業日比、発表日時を通知
+- 価格表画像を生成した場合、LINE WORKSには公開URLのリンクボタンを付け、LINEには画像として添付
 
 ## ディレクトリ
+
+次のパスはすべて例です。`YOUR_ACCOUNT` と `YOUR_DOMAIN` を実環境の値に置き換えてください。
 
 非公開領域:
 
 ~~~text
-/home/SERVER_ID/ops/retanaka-bot/retanaka_xserver_bot.py
-/home/SERVER_ID/ops/retanaka-bot/config.json
-/home/SERVER_ID/ops/retanaka-bot/storage/
+/home/YOUR_ACCOUNT/ops/retanaka-bot/retanaka_xserver_bot.py
+/home/YOUR_ACCOUNT/ops/retanaka-bot/config.json
+/home/YOUR_ACCOUNT/ops/retanaka-bot/storage/
+/home/YOUR_ACCOUNT/ops/retanaka-bot/cron.log
 ~~~
 
 公開領域:
 
 ~~~text
-/home/SERVER_ID/DOMAIN/public_html/retanaka-bot/retanaka-bot-images/
+/home/YOUR_ACCOUNT/YOUR_DOMAIN/public_html/retanaka-bot-images/
 ~~~
 
-public_html 配下はインターネットから閲覧できます。Webhook URL、APIキー、トークン、メールアドレス、個人情報を保存しないでください。
+`public_html` 配下はインターネットから閲覧できます。公開領域には生成したランダム名の価格表画像だけを置き、Webhook URL、APIキー、トークン、グループID、メールアドレス、個人情報、コード、設定、状態、ログは保存しません。
 
 ## 設定
 
-config.example.json を config.json として非公開領域へ配置し、実値を設定します。
+`config.example.json` を `config.json` として非公開領域へ配置し、プレースホルダーを実値に置き換えます。
 
-主要項目:
+設定名は実装と一致させてください。
 
-- lineworks_webhook_url: LINE WORKS Incoming Webhook URL
-- state_file: 価格履歴と送信状態
-- screenshotone_access_key: ScreenshotOne APIキー
-- screenshot_public_dir: 公開画像ディレクトリ
-- screenshot_public_base_url: 公開画像URL
-- screenshot_retention_hours: 次回画像取得時に削除する画像の保持期限
-- screenshot_delete_after_seconds: 送信後に同一プロセスで削除するまでの秒数。0 は即時削除なし
+- 配信: `line_channel_access_token`, `line_group_id`, `lineworks_webhook_url`
+- 価格・状態: `price_url`, `timezone`, `state_file`, `lock_file`
+- アラート: `alert_email`, `alert_email_from`, `sendmail_path`
+- 画像: `enable_section_screenshot`, `require_screenshot`, `screenshot_api_url`, `screenshotone_access_key`, `screenshot_public_dir`, `screenshot_public_base_url`, `screenshot_selector`, `screenshot_wait_for_selector`, `screenshot_hide_selectors`, `screenshot_retention_hours`, `screenshot_delete_after_seconds`
 
-推奨権限:
+`state_file` と `lock_file` は非公開領域に置きます。`screenshot_public_dir` だけは公開画像ディレクトリを指定します。
+
+## 推奨パーミッション
 
 ~~~text
-/home/SERVER_ID/ops/retanaka-bot                 700
-config.json                                      600
-storage/                                         700
-storage/retanaka_price_state.json                600
-retanaka_xserver_bot.py                          700
-公開画像ディレクトリ                             755
-公開画像                                         644
+/home/YOUR_ACCOUNT/ops/retanaka-bot                 700
+retanaka_xserver_bot.py                              700
+config.json                                          600
+storage/                                              700
+storage/retanaka_price_state.json                     600
+storage/retanaka_price.lock                          600
+cron.log                                              600
+公開画像ディレクトリ                                  755
+公開画像                                              644
 ~~~
 
-## テスト
+## 実行確認
 
 送信せず取得内容を確認:
 
 ~~~bash
-/usr/bin/python3.6 /home/SERVER_ID/ops/retanaka-bot/retanaka_xserver_bot.py \
-  --config /home/SERVER_ID/ops/retanaka-bot/config.json \
+/usr/bin/python3.6 /home/YOUR_ACCOUNT/ops/retanaka-bot/retanaka_xserver_bot.py \
+  --config /home/YOUR_ACCOUNT/ops/retanaka-bot/config.json \
   --dry-run
 ~~~
 
-LINE WORKSへ1回だけ強制送信:
+LINE WORKSだけを1回テスト送信し、通常の状態を変更しない:
 
 ~~~bash
-/usr/bin/python3.6 /home/SERVER_ID/ops/retanaka-bot/retanaka_xserver_bot.py \
-  --config /home/SERVER_ID/ops/retanaka-bot/config.json \
+/usr/bin/python3.6 /home/YOUR_ACCOUNT/ops/retanaka-bot/retanaka_xserver_bot.py \
+  --config /home/YOUR_ACCOUNT/ops/retanaka-bot/config.json \
+  --test-lineworks-only
+~~~
+
+同じ発表時刻でも送信を強制する場合:
+
+~~~bash
+/usr/bin/python3.6 /home/YOUR_ACCOUNT/ops/retanaka-bot/retanaka_xserver_bot.py \
+  --config /home/YOUR_ACCOUNT/ops/retanaka-bot/config.json \
   --force-send
 ~~~
 
 ## Cron
 
-毎分実行:
+毎分実行します。Cronのログも非公開領域に置きます。
 
 ~~~cron
-* * * * * /usr/bin/python3.6 /home/SERVER_ID/ops/retanaka-bot/retanaka_xserver_bot.py --config /home/SERVER_ID/ops/retanaka-bot/config.json >> /home/SERVER_ID/ops/retanaka-bot/cron.log 2>&1
+* * * * * /usr/bin/python3.6 /home/YOUR_ACCOUNT/ops/retanaka-bot/retanaka_xserver_bot.py --config /home/YOUR_ACCOUNT/ops/retanaka-bot/config.json >> /home/YOUR_ACCOUNT/ops/retanaka-bot/cron.log 2>&1
 ~~~
 
-送信済みの日は価格ページへアクセスする前に終了します。同じ発表時刻の二重送信も防止します。
+発表時刻は状態ファイルで管理します。LINEは当日最初の発表だけ、LINE WORKSは新しい発表ごとに送信し、プロセスロックで重複実行を防ぎます。

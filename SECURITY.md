@@ -1,30 +1,39 @@
 # Security
 
-## Secrets
+## 秘密情報
 
-Never commit:
+次の値は実値をリポジトリ、`public_html`、ログへ保存しないでください。
 
-- LINE WORKS Incoming Webhook URLs
-- ScreenshotOne API keys
-- Xserver API keys or FTPS passwords
-- LINE legacy channel tokens or group IDs
-- email addresses used for alerts
-- production config or state files
+- LINE WORKS Incoming Webhook URL
+- LINE Messaging APIのアクセストークンとグループID
+- ScreenshotOne APIキー
+- Xserver APIキー、FTP/FTPSパスワード
+- アラート用メールアドレス
+- 本番の設定・状態ファイル
 
-Use config.example.json and .retanaka.env.example as templates only.
+`xserver/config.example.json` と `.retanaka.env.example` はプレースホルダーだけのテンプレートです。
 
-## Xserver layout
+## Xserverの配置
 
-Store executable code, config, logs, and state outside public_html. The public image directory is intentionally internet-accessible and must contain only generated screenshots of public price information.
+実行コード、設定、状態、ログ、ロックは `public_html` の外へ置きます。`public_html` はインターネットから閲覧できるため、公開領域には生成したランダム名の価格表画像だけを保存します。コード、設定、状態、ログ、認証情報、個人情報は置きません。
 
-Recommended permissions:
+## 推奨パーミッション
 
-- private directories: 700
-- private config, state, and logs: 600
-- executable scripts: 700
-- public image directory: 755
-- public screenshots: 644
+- 非公開ディレクトリ: `700`
+- 実行コード: `700`
+- 設定ファイル: `600`
+- 状態ファイル: `600`
+- ログファイル: `600`
+- ロックファイル: `600`
+- 公開ディレクトリ: `755`
+- 公開画像: `644`
 
-## Reporting
+## 通知ポリシー
 
-Do not open a public issue containing credentials or production identifiers. Revoke exposed webhook URLs and API keys before reporting an incident.
+- LINEは当日の最初の新しい発表だけ送信する
+- LINE WORKSは発表時刻が新しくなるたびに送信する
+- `--test-lineworks-only` はLINE WORKSだけへ送信し、通常の観測・履歴・配信状態を変更しない
+
+## 事故対応
+
+認証情報や本番識別子を含む公開Issueを作成しないでください。Webhook URL、APIキー、トークン、パスワードを公開した場合は、報告前に失効・再発行してください。
