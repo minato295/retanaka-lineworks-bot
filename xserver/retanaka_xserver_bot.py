@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.header import Header
 from email.mime.text import MIMEText
+from email.utils import make_msgid
 from html import unescape
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -70,6 +71,7 @@ def make_empty_state():
             },
         },
         "error_alert_dates": {},
+        "pending_recovery_alerts": {},
         "test_email_sent_at": None,
     }
 
@@ -417,6 +419,24 @@ def migrate_state(data):
     for key, value in raw_error_alert_dates.items():
         if isinstance(key, str) and isinstance(value, str):
             error_alert_dates[key] = value
+    raw_pending_recovery_alerts = data.get("pending_recovery_alerts")
+    if not isinstance(raw_pending_recovery_alerts, dict):
+        raw_pending_recovery_alerts = {}
+    pending_recovery_alerts = {}
+    for key, value in raw_pending_recovery_alerts.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        subject = value.get("subject")
+        body = value.get("body")
+        message_id = value.get("message_id")
+        occurred_at = value.get("occurred_at")
+        if all(isinstance(item, str) and item for item in (subject, body, message_id, occurred_at)):
+            pending_recovery_alerts[key] = {
+                "subject": subject,
+                "body": body,
+                "message_id": message_id,
+                "occurred_at": occurred_at,
+            }
     test_email_sent_at = data.get("test_email_sent_at")
     if not isinstance(test_email_sent_at, str):
         test_email_sent_at = None
@@ -434,6 +454,7 @@ def migrate_state(data):
                 "lineworks": {"last_sent_published_at": lineworks_last_sent_published_at},
             },
             "error_alert_dates": error_alert_dates,
+            "pending_recovery_alerts": pending_recovery_alerts,
             "test_email_sent_at": test_email_sent_at,
         }
     )
@@ -820,7 +841,18 @@ def summarize_screenshot_error_for_user(error_text):
     return "ScreenshotOne障害のため画像を取得できませんでした。"
 
 
-def send_alert_email(config, subject, body):
+def build_alert_email(subject, body, in_reply_to=None, references=None):
+    message = MIMEText(body, _subtype="plain", _charset="utf-8")
+    message["Subject"] = Header(subject, "utf-8")
+    message["Message-ID"] = make_msgid()
+    if in_reply_to:
+        message["In-Reply-To"] = in_reply_to
+    if references:
+        message["References"] = references
+    return message
+
+
+def send_alert_email(config, subject, body, in_reply_to=None, references=None):
     recipient = str(config.get("alert_email", "")).strip()
     if not recipient:
         return False
@@ -829,8 +861,7 @@ def send_alert_email(config, subject, body):
     if not os.path.exists(sendmail_path):
         raise RuntimeError("sendmail not found: {0}".format(sendmail_path))
 
-    message = MIMEText(body, _subtype="plain", _charset="utf-8")
-    message["Subject"] = Header(subject, "utf-8")
+    message = build_alert_email(subject, body, in_reply_to, references)
     message["From"] = str(config.get("alert_email_from", "retanaka-bot@localhost")).strip() or "retanaka-bot@localhost"
     message["To"] = recipient
 
@@ -848,6 +879,167 @@ def send_alert_email(config, subject, body):
                 stderr.decode("utf-8", errors="replace").strip(),
             )
         )
+    return message["Message-ID"]
+
+
+def classify_error(error, alert_key=None):
+    error_text = str(error).lower()
+    if alert_key == "config_error" or any(
+        marker in error_text
+        for marker in ("config file", "invalid json config", "config root", "missing required config")
+    ):
+        return {
+            "cause": "BOTの設定ファイルに不足または不正な値があります。",
+            "bot_action": "設定が直るまで、この処理は実行できません。",
+            "required_action": "設定ファイルを確認してください。技術情報に記載された項目が手掛かりです。",
+        }
+    if alert_key == "screenshot_error" or "スクリーンショットapi" in error_text or "screenshotone" in error_text:
+        cause = "スクリーンショット取得サービスでエラーが発生しました。"
+        if "http 401" in error_text or "http 403" in error_text:
+            cause = "スクリーンショット取得サービスの認証またはアクセス権限が拒否されました。"
+        elif "http 429" in error_text or "quota" in error_text or "limit" in error_text:
+            cause = "スクリーンショット取得サービスの利用上限に達しました。"
+        return {
+            "cause": cause,
+            "bot_action": "次の価格更新時に画像取得を再試行します。",
+            "required_action": "繰り返す場合はScreenshotOneの稼働状況、認証情報、利用上限を確認してください。",
+        }
+    if alert_key in ("line_delivery_error", "line_limit_error", "lineworks_delivery_error") or any(
+        marker in error_text for marker in ("line api", "line works webhook", "line works")
+    ):
+        return {
+            "cause": "通知先サービスが送信要求を受け付けませんでした。",
+            "bot_action": "次回の毎分実行で、未送信の通知を自動的に再試行します。",
+            "required_action": "繰り返す場合は通知先の稼働状況、Webhook、認証情報を確認してください。",
+        }
+    if any(
+        marker in error_text
+        for marker in ("価格を取得できませんでした", "価格の発表日時を取得できませんでした", "銀製品")
+    ):
+        return {
+            "cause": "価格ページの表示内容をBOTが読み取れませんでした。",
+            "bot_action": "次回の毎分実行で自動的に再試行します。",
+            "required_action": "繰り返す場合は価格ページの表示変更を確認してください。",
+        }
+    if "connection reset by peer" in error_text or "connection reset" in error_text:
+        cause = "接続先との通信が途中で切断されました。"
+    elif "timeout" in error_text or "timed out" in error_text:
+        cause = "接続先からの応答が時間内に返りませんでした。"
+    elif "name or service not known" in error_text or "temporary failure in name resolution" in error_text:
+        cause = "接続先の名前解決に失敗しました。"
+    elif "ssl" in error_text or "certificate" in error_text:
+        cause = "接続先との安全な通信を確立できませんでした。"
+    elif "http 401" in error_text or "http 403" in error_text:
+        cause = "接続先の認証またはアクセス権限が拒否されました。"
+    elif "http 429" in error_text or "quota" in error_text or "limit" in error_text:
+        cause = "接続先の利用上限に達したため、要求が受け付けられませんでした。"
+    elif re.search(r"http 5[0-9]{2}", error_text):
+        cause = "接続先で一時的なサーバーエラーが発生しました。"
+    else:
+        cause = "予期しないエラーが発生しました。"
+    return {
+        "cause": cause,
+        "bot_action": "次回の毎分実行で自動的に再試行します。",
+        "required_action": "通常は対応不要です。繰り返す場合は接続先の障害状況を確認してください。",
+    }
+
+
+def redact_sensitive_text(value, config=None):
+    text = str(value)
+    if isinstance(config, dict):
+        for key in (
+            "line_channel_access_token",
+            "line_group_id",
+            "lineworks_webhook_url",
+            "screenshotone_access_key",
+            "alert_email",
+        ):
+            secret = str(config.get(key, "")).strip()
+            if len(secret) >= 4:
+                text = text.replace(secret, "[伏字]")
+    text = re.sub(
+        r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+",
+        r"\1[伏字]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)((?:access[_ -]?(?:token|key)|api[_ -]?key|token|secret|password)\s*[=:]\s*)[^\s,;&]+",
+        r"\1[伏字]",
+        text,
+    )
+    return text
+
+
+def format_error_alert_body(body_lines, alert_key=None, config=None):
+    error_text = None
+    formatted_lines = []
+    for line in body_lines:
+        if line.startswith("エラー: "):
+            error_text = redact_sensitive_text(line[len("エラー: ") :], config)
+        else:
+            formatted_lines.append(redact_sensitive_text(line, config))
+    if error_text is None:
+        return "\n".join(formatted_lines)
+
+    classified = classify_error(error_text, alert_key)
+    formatted_lines.extend(
+        [
+            "原因: {0}".format(classified["cause"]),
+            "BOTの動作: {0}".format(classified["bot_action"]),
+            "必要な対応: {0}".format(classified["required_action"]),
+            "技術情報: {0}".format(error_text),
+        ]
+    )
+    return "\n".join(formatted_lines)
+
+
+def build_recovery_alert_body(original_body):
+    quoted_original = "\n".join(
+        "> {0}".format(line) for line in original_body.splitlines()
+    )
+    return "\n".join(
+        [
+            "RE:TANAKA BOT のエラーは自動復旧済み・対応不要です。",
+            "",
+            "以下は元のエラー通知です。",
+            quoted_original,
+        ]
+    )
+
+
+def build_recovery_alert_email(pending_alert):
+    subject = "Re: {0}".format(pending_alert["subject"])
+    message_id = pending_alert["message_id"]
+    return build_alert_email(
+        subject,
+        build_recovery_alert_body(pending_alert["body"]),
+        in_reply_to=message_id,
+        references=message_id,
+    )
+
+
+def maybe_send_recovery_alert(config, state, alert_key):
+    pending_alerts = state.get("pending_recovery_alerts")
+    if not isinstance(pending_alerts, dict):
+        return False
+    pending_alert = pending_alerts.get(alert_key)
+    if not isinstance(pending_alert, dict):
+        return False
+
+    message = build_recovery_alert_email(pending_alert)
+    message_id = send_alert_email(
+        config,
+        "Re: {0}".format(pending_alert["subject"]),
+        message.get_payload(decode=True).decode("utf-8"),
+        in_reply_to=pending_alert["message_id"],
+        references=pending_alert["message_id"],
+    )
+    if not message_id:
+        return False
+    del pending_alerts[alert_key]
+    alert_dates = state.get("error_alert_dates")
+    if isinstance(alert_dates, dict):
+        alert_dates.pop(alert_key, None)
     return True
 
 
@@ -880,8 +1072,20 @@ def maybe_send_error_alert(config, state, alert_key, subject, body_lines):
     if was_error_alert_sent_today(state, alert_key, today_key):
         return False
 
-    send_alert_email(config, subject, "\n".join(body_lines))
+    body = format_error_alert_body(body_lines, alert_key, config)
+    message_id = send_alert_email(config, subject, body)
     mark_error_alert_sent(state, alert_key, today_key)
+    if isinstance(message_id, str) and message_id:
+        pending_alerts = state.get("pending_recovery_alerts")
+        if not isinstance(pending_alerts, dict):
+            pending_alerts = {}
+            state["pending_recovery_alerts"] = pending_alerts
+        pending_alerts[alert_key] = {
+            "subject": subject,
+            "body": body,
+            "message_id": message_id,
+            "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
     return True
 
 
@@ -1043,6 +1247,12 @@ def _run(argv, preloaded_config=None):
     state = load_state(config["state_file"])
     if not args.dry_run and not args.test_lineworks_only:
         try:
+            if maybe_send_recovery_alert(config, state, "config_error"):
+                print("設定読み込みエラーからの復旧通知メールを送信しました", file=sys.stderr)
+                save_state(config["state_file"], state)
+        except Exception as recovery_exc:
+            print("設定読み込みエラーからの復旧通知メール送信に失敗しました: {0}".format(recovery_exc), file=sys.stderr)
+        try:
             if maybe_send_test_email(config, state):
                 print("初回テストメールを送信しました", file=sys.stderr)
                 save_state(config["state_file"], state)
@@ -1055,7 +1265,8 @@ def _run(argv, preloaded_config=None):
         html = fetch_html(config["price_url"])
         current = parse_snapshot(html)
     except Exception as exc:
-        print("価格取得に失敗しました: {0}".format(exc), file=sys.stderr)
+        safe_error = redact_sensitive_text(exc, config)
+        print("価格取得に失敗しました: {0}".format(safe_error), file=sys.stderr)
         if not args.test_lineworks_only:
             try:
                 if maybe_send_error_alert(
@@ -1068,7 +1279,7 @@ def _run(argv, preloaded_config=None):
                         "",
                         "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                         "取得元: {0}".format(config["price_url"]),
-                        "エラー: {0}".format(exc),
+                        "エラー: {0}".format(safe_error),
                     ],
                 ):
                     print("価格取得エラー通知メールを送信しました", file=sys.stderr)
@@ -1076,6 +1287,14 @@ def _run(argv, preloaded_config=None):
                 print("価格取得エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
             save_state(config["state_file"], state)
         return 1
+
+    if not args.dry_run and not args.test_lineworks_only:
+        try:
+            if maybe_send_recovery_alert(config, state, "price_fetch_error"):
+                print("価格取得エラーからの復旧通知メールを送信しました", file=sys.stderr)
+                save_state(config["state_file"], state)
+        except Exception as recovery_exc:
+            print("価格取得エラーからの復旧通知メール送信に失敗しました: {0}".format(recovery_exc), file=sys.stderr)
 
     previous_day = get_previous_day_snapshot(state, current.published_at)
     message = build_message(current, previous_day, config["price_url"])
@@ -1146,7 +1365,7 @@ def _run(argv, preloaded_config=None):
                 screenshot_path, screenshot_url = capture_screenshot_if_enabled(config, current)
                 print("スクリーンショットURL: {0}".format(screenshot_url))
             except Exception as exc:
-                screenshot_error = str(exc)
+                screenshot_error = redact_sensitive_text(exc, config)
                 print("スクリーンショット取得に失敗: {0}".format(screenshot_error), file=sys.stderr)
                 print(
                     "画像なし理由: {0}".format(summarize_screenshot_error_for_user(screenshot_error)),
@@ -1167,7 +1386,7 @@ def _run(argv, preloaded_config=None):
         try:
             screenshot_path, screenshot_url = capture_screenshot_if_enabled(config, current)
         except Exception as exc:
-            screenshot_error = str(exc)
+            screenshot_error = redact_sensitive_text(exc, config)
             if config.get("require_screenshot", True):
                 print("スクリーンショット取得に失敗しました: {0}".format(screenshot_error), file=sys.stderr)
                 try:
@@ -1192,6 +1411,19 @@ def _run(argv, preloaded_config=None):
                     )
                 save_state(config["state_file"], state)
                 return 1
+
+        if screenshot_error is None:
+            try:
+                if maybe_send_recovery_alert(config, state, "screenshot_error"):
+                    print("スクリーンショット取得エラーからの復旧通知メールを送信しました", file=sys.stderr)
+                    save_state(config["state_file"], state)
+            except Exception as recovery_exc:
+                print(
+                    "スクリーンショット取得エラーからの復旧通知メール送信に失敗しました: {0}".format(
+                        recovery_exc
+                    ),
+                    file=sys.stderr,
+                )
 
     if screenshot_error:
         message = (
@@ -1227,15 +1459,23 @@ def _run(argv, preloaded_config=None):
             )
         except Exception as exc:
             delivery_failed = True
-            print("LINE送信に失敗しました: {0}".format(exc), file=sys.stderr)
+            safe_error = redact_sensitive_text(exc, config)
+            print("LINE送信に失敗しました: {0}".format(safe_error), file=sys.stderr)
             try:
-                if maybe_send_delivery_error_alert(config, state, "line", exc, current.published_at):
+                if maybe_send_delivery_error_alert(config, state, "line", safe_error, current.published_at):
                     save_state(config["state_file"], state)
             except Exception as alert_exc:
                 print("LINE送信エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
         else:
             state["deliveries"]["line"]["last_sent_published_at"] = current.published_at
             state["deliveries"]["line"]["last_sent_date"] = published_date_key
+            try:
+                recovered = maybe_send_recovery_alert(config, state, "line_delivery_error")
+                limit_recovered = maybe_send_recovery_alert(config, state, "line_limit_error")
+                if recovered or limit_recovered:
+                    print("LINE送信エラーからの復旧通知メールを送信しました", file=sys.stderr)
+            except Exception as recovery_exc:
+                print("LINE送信エラーからの復旧通知メール送信に失敗しました: {0}".format(recovery_exc), file=sys.stderr)
             save_state(config["state_file"], state)
 
     if send_lineworks:
@@ -1246,14 +1486,23 @@ def _run(argv, preloaded_config=None):
             )
         except Exception as exc:
             delivery_failed = True
-            print("LINE WORKS送信に失敗しました: {0}".format(exc), file=sys.stderr)
+            safe_error = redact_sensitive_text(exc, config)
+            print("LINE WORKS送信に失敗しました: {0}".format(safe_error), file=sys.stderr)
             try:
-                if maybe_send_delivery_error_alert(config, state, "lineworks", exc, current.published_at):
+                if maybe_send_delivery_error_alert(config, state, "lineworks", safe_error, current.published_at):
                     save_state(config["state_file"], state)
             except Exception as alert_exc:
                 print("LINE WORKS送信エラー通知メール送信に失敗しました: {0}".format(alert_exc), file=sys.stderr)
         else:
             state["deliveries"]["lineworks"]["last_sent_published_at"] = current.published_at
+            try:
+                if maybe_send_recovery_alert(config, state, "lineworks_delivery_error"):
+                    print("LINE WORKS送信エラーからの復旧通知メールを送信しました", file=sys.stderr)
+            except Exception as recovery_exc:
+                print(
+                    "LINE WORKS送信エラーからの復旧通知メール送信に失敗しました: {0}".format(recovery_exc),
+                    file=sys.stderr,
+                )
             save_state(config["state_file"], state)
 
     if delivery_failed:
