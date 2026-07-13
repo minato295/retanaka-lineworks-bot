@@ -51,7 +51,7 @@ class StoreLineCredentialsTests(unittest.TestCase):
             module.subprocess, "run"
         ) as run:
             module.main(["group"])
-        self.assertIn("RE:TANAKA LINE group ID", run.call_args.args[0])
+        self.assertIn("RE:TANAKA LINE group ID", run.call_args[0][0])
 
 
 if __name__ == "__main__":
