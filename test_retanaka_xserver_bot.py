@@ -16,6 +16,10 @@ def load_module():
     assert spec and spec.loader
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # Removed delivery adapters remain patchable in unrelated legacy tests until those
+    # cases are replaced by LINE-only equivalents.
+    if not hasattr(module, "send_lineworks_webhook"):
+        module.send_lineworks_webhook = lambda *args, **kwargs: None
     return module
 
 
@@ -36,7 +40,6 @@ class RetanakaXserverBotTests(unittest.TestCase):
                 {
                     "line_channel_access_token": "test-token",
                     "line_group_id": "test-group",
-                    "lineworks_webhook_url": "https://webhook.worksmobile.com/message/example",
                     "state_file": str(state_file),
                     "enable_section_screenshot": False,
                 }
@@ -57,6 +60,174 @@ class RetanakaXserverBotTests(unittest.TestCase):
         next_day = self.make_snapshot(bot, "2026-07-12 09:30")
         self.assertTrue(bot.should_deliver_line(state, next_day, "2026-07-12"))
 
+    def test_normal_cron_skips_second_update_and_sends_first_update_next_day(self) -> None:
+        bot = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            config_path = self.write_delivery_config(temp_dir, state_path)
+            same_day = self.make_snapshot(bot, "2026-09-05 14:00")
+            next_day = self.make_snapshot(bot, "2026-09-06 09:30")
+            state = bot.make_empty_state()
+            state["test_email_sent_at"] = "2026-09-05 00:00:00"
+            state["last_observed_published_at"] = "2026-09-05 09:30"
+            state["deliveries"]["line"] = {
+                "last_sent_published_at": "2026-09-05 09:30",
+                "last_sent_date": "2026-09-05",
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with mock.patch.object(bot, "fetch_html", return_value="ignored"), mock.patch.object(
+                bot, "parse_snapshot", side_effect=[same_day, next_day]
+            ), mock.patch.object(bot, "send_line_messages") as send_line:
+                with mock.patch.object(bot, "datetime", wraps=bot.datetime) as clock:
+                    clock.now.return_value = bot.datetime(2026, 9, 5, 14, 0, 5)
+                    self.assertEqual(bot.main(["--config", str(config_path)]), 0)
+                with mock.patch.object(bot, "datetime", wraps=bot.datetime) as clock:
+                    clock.now.return_value = bot.datetime(2026, 9, 6, 9, 30, 5)
+                    self.assertEqual(bot.main(["--config", str(config_path)]), 0)
+
+            send_line.assert_called_once()
+            saved_state = bot.load_state(str(state_path))
+            self.assertEqual(saved_state["deliveries"]["line"]["last_sent_date"], "2026-09-06")
+
+    def test_read_config_allows_line_only_without_lineworks_webhook(self) -> None:
+        bot = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "line_channel_access_token": "test-token",
+                        "line_group_id": "test-group",
+                        "enable_section_screenshot": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = bot.read_config(str(config_path))
+
+        self.assertNotIn("lineworks_webhook_url", config)
+
+    def test_lineworks_disabled_routes_errors_directly_to_email(self) -> None:
+        bot = load_module()
+        state = bot.make_empty_state()
+        config = {
+            "alert_email": "ops@example.com",
+        }
+
+        with mock.patch.object(bot, "send_alert_email", return_value="<error@example.com>") as email:
+            result = bot.deliver_error_alert(
+                config,
+                state,
+                "price_fetch_error",
+                "RE:TANAKA BOT: 価格取得エラー",
+                "価格取得に失敗しました。",
+            )
+
+        email.assert_called_once_with(
+            config,
+            "RE:TANAKA BOT: 価格取得エラー",
+            "価格取得に失敗しました。",
+        )
+        self.assertEqual(result, {"transport": "email", "message_id": "<error@example.com>"})
+
+    def test_lineworks_disabled_sends_line_only_and_discards_stale_lineworks_alert(self) -> None:
+        bot = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "line_channel_access_token": "test-token",
+                        "line_group_id": "test-group",
+                        "state_file": str(state_path),
+                        "enable_section_screenshot": False,
+                        "alert_email": "ops@example.com",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            snapshot = self.make_snapshot(bot, "2026-09-05 09:30")
+            state = bot.make_empty_state()
+            state["test_email_sent_at"] = "2026-09-05 00:00:00"
+            state["last_observed_published_at"] = snapshot.published_at
+            state["error_alert_dates"]["lineworks_delivery_error"] = "2026-09-05"
+            state["pending_recovery_alerts"]["lineworks_delivery_error"] = {
+                "transport": "email",
+                "subject": "RE:TANAKA BOT: LINE WORKS送信エラー",
+                "body": "古いLINE WORKS送信エラー",
+                "message_id": "<lineworks-error@example.com>",
+                "occurred_at": "2026-09-05 00:00:03",
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with mock.patch.object(bot, "datetime", wraps=bot.datetime) as mock_datetime:
+                mock_datetime.now.return_value = bot.datetime(2026, 9, 5, 9, 30, 0)
+                with mock.patch.object(bot, "fetch_html", return_value="ignored"), mock.patch.object(
+                    bot, "parse_snapshot", return_value=snapshot
+                ), mock.patch.object(bot, "send_line_messages") as send_line, mock.patch.object(
+                    bot, "send_alert_email"
+                ) as send_email:
+                    result = bot.main(["--config", str(config_path)])
+
+            self.assertEqual(result, 0)
+            send_line.assert_called_once()
+            send_email.assert_not_called()
+            saved_state = bot.load_state(str(state_path))
+            self.assertNotIn("lineworks_delivery_error", saved_state["error_alert_dates"])
+            self.assertNotIn("lineworks_delivery_error", saved_state["pending_recovery_alerts"])
+
+    def test_migrate_v3_removes_lineworks_delivery_and_recovery_state(self) -> None:
+        bot = load_module()
+
+        state = bot.migrate_state(
+            {
+                "schema_version": 3,
+                "deliveries": {
+                    "line": {
+                        "last_sent_published_at": "2026-09-04 09:30",
+                        "last_sent_date": "2026-09-04",
+                    },
+                    "lineworks": {"last_sent_published_at": "2026-09-04 17:00"},
+                },
+                "error_alert_dates": {
+                    "lineworks_delivery_error": "2026-09-05",
+                    "price_fetch_error": "2026-09-05",
+                },
+                "pending_recovery_alerts": {
+                    "lineworks_delivery_error": {
+                        "transport": "email",
+                        "subject": "RE:TANAKA BOT: LINE WORKS送信エラー",
+                        "body": "本文",
+                        "message_id": "<lineworks@example.com>",
+                        "occurred_at": "2026-09-05 00:00:03",
+                    },
+                    "price_fetch_error": {
+                        "transport": "lineworks",
+                        "subject": "RE:TANAKA BOT: 価格取得エラー",
+                        "body": "本文",
+                        "occurred_at": "2026-09-04 10:00:00",
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(
+            state["deliveries"],
+            {
+                "line": {
+                    "last_sent_published_at": "2026-09-04 09:30",
+                    "last_sent_date": "2026-09-04",
+                }
+            },
+        )
+        self.assertNotIn("lineworks_delivery_error", state["error_alert_dates"])
+        self.assertNotIn("price_fetch_error", state["error_alert_dates"])
+        self.assertEqual(state["pending_recovery_alerts"], {})
+
     def test_lineworks_sends_every_new_publication(self) -> None:
         bot = load_module()
         state = bot.make_empty_state()
@@ -68,10 +239,10 @@ class RetanakaXserverBotTests(unittest.TestCase):
         self.assertFalse(bot.should_deliver_lineworks(state, first))
         self.assertTrue(bot.should_deliver_lineworks(state, later))
 
-    def test_make_empty_state_uses_schema_v3(self):
+    def test_make_empty_state_uses_schema_v4(self):
         bot = load_module()
 
-        self.assertEqual(bot.make_empty_state()["schema_version"], 3)
+        self.assertEqual(bot.make_empty_state()["schema_version"], 4)
 
     def test_migrate_v2_preserves_legacy_pending_as_email(self):
         bot = load_module()
@@ -101,10 +272,7 @@ class RetanakaXserverBotTests(unittest.TestCase):
         self.assertEqual(
             state["pending_recovery_alerts"]["price_fetch_error"]["message_id"], "<old@example.com>"
         )
-        self.assertEqual(state["pending_recovery_alerts"]["lineworks_delivery_error"]["transport"], "email")
-        self.assertEqual(
-            state["pending_recovery_alerts"]["lineworks_delivery_error"]["message_id"], "<lw@example.com>"
-        )
+        self.assertNotIn("lineworks_delivery_error", state["pending_recovery_alerts"])
 
     def test_migrate_v3_rejects_unknown_transport(self):
         bot = load_module()
@@ -228,10 +396,8 @@ class RetanakaXserverBotTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(state["schema_version"], 3)
-        self.assertEqual(
-            state["deliveries"]["lineworks"]["last_sent_published_at"], "2026-07-11 09:30"
-        )
+        self.assertEqual(state["schema_version"], 4)
+        self.assertNotIn("lineworks", state["deliveries"])
         self.assertIsNone(state["deliveries"]["line"]["last_sent_date"])
         self.assertIsNone(state["deliveries"]["line"]["last_sent_published_at"])
         self.assertEqual(state["error_alert_dates"], {"price_fetch_error": "2026-07-11"})
@@ -248,10 +414,10 @@ class RetanakaXserverBotTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(state["schema_version"], 3)
+        self.assertEqual(state["schema_version"], 4)
         self.assertEqual(len(state["history"]), 1)
         self.assertEqual(state["deliveries"]["line"]["last_sent_date"], "2026-07-10")
-        self.assertIsNone(state["deliveries"]["lineworks"]["last_sent_published_at"])
+        self.assertNotIn("lineworks", state["deliveries"])
 
     def test_connection_reset_error_is_classified_in_japanese(self) -> None:
         bot = load_module()
@@ -268,7 +434,7 @@ class RetanakaXserverBotTests(unittest.TestCase):
         self.assertIn("価格ページ", bot.classify_error(RuntimeError("価格を取得できませんでした"))["cause"])
         self.assertIn("設定", bot.classify_error(RuntimeError("missing required config: line_group_id"))["cause"])
         self.assertIn("スクリーンショット", bot.classify_error(RuntimeError("ScreenshotOne HTTP 500"))["cause"])
-        self.assertIn("通知先", bot.classify_error(RuntimeError("LINE WORKS webhook HTTP 400"))["cause"])
+        self.assertIn("通知先", bot.classify_error(RuntimeError("LINE API HTTP 400"))["cause"])
 
     def test_non_lineworks_error_uses_lineworks_only(self):
         bot = load_module()
@@ -805,16 +971,7 @@ class RetanakaXserverBotTests(unittest.TestCase):
             config_path = Path(temp_dir) / "config.json"
             original = {"schema_version": 3, "last_observed_published_at": "2026-07-13 09:30"}
             state_path.write_text(json.dumps(original), encoding="utf-8")
-            config_path.write_text(
-                json.dumps(
-                    {
-                        "lineworks_webhook_url": "https://example.com/webhook",
-                        "alert_email": "ops@example.com",
-                        "state_file": str(state_path),
-                    }
-                ),
-                encoding="utf-8",
-            )
+            config_path.write_text("{invalid-json", encoding="utf-8")
 
             with mock.patch.object(bot, "send_lineworks_webhook") as webhook, mock.patch.object(
                 bot, "send_alert_email"
@@ -843,20 +1000,29 @@ class RetanakaXserverBotTests(unittest.TestCase):
             self.assertFalse(state_path.exists())
             self.assertIn("田中貴金属", output.getvalue())
 
-    def test_price_fetch_notification_log_does_not_claim_email_delivery(self):
+    def test_price_fetch_error_is_reported_by_email(self):
         bot = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             state_path = Path(temp_dir) / "state.json"
             config_path = self.write_delivery_config(temp_dir, state_path)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["alert_email"] = "ops@example.com"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            state_path.write_text(
+                json.dumps({"schema_version": 4, "test_email_sent_at": "2026-09-05 00:00:00"}),
+                encoding="utf-8",
+            )
             with mock.patch.object(
                 bot, "fetch_html", side_effect=RuntimeError("Connection reset")
-            ), mock.patch.object(bot, "send_lineworks_webhook"), mock.patch.object(
+            ), mock.patch.object(
+                bot, "send_alert_email", return_value="<error@example.com>"
+            ) as email, mock.patch.object(
                 bot.sys, "stderr", new_callable=io.StringIO
             ) as stderr:
                 self.assertEqual(bot.main(["--config", str(config_path)]), 1)
 
+        email.assert_called_once()
         self.assertIn("価格取得エラー通知を送信しました", stderr.getvalue())
-        self.assertNotIn("価格取得エラー通知メール", stderr.getvalue())
 
     def test_recovery_clears_daily_suppression_for_a_later_failure(self) -> None:
         bot = load_module()
@@ -888,8 +1054,7 @@ class RetanakaXserverBotTests(unittest.TestCase):
                 "line": {
                     "last_sent_date": "2026-07-11",
                     "last_sent_published_at": snapshot.published_at,
-                },
-                "lineworks": {"last_sent_published_at": snapshot.published_at},
+                }
             }
             state_path.write_text(
                 json.dumps(
@@ -1306,6 +1471,30 @@ class RetanakaXserverBotTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(send_lineworks.call_args[0][1]["button"]["url"], "https://example.com/image.png")
             self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), original_state)
+
+
+_REMOVED_LINEWORKS_TESTS = {
+    "test_direct_error_alert_redacts_configured_secret_from_all_delivery_paths",
+    "test_delivery_failures_send_independent_alerts_and_preserve_line_limit_alert",
+    "test_equal_observation_retries_only_failed_delivery_channel",
+    "test_failed_recovery_redacts_pending_body_before_state_is_saved",
+    "test_recovery_redacts_legacy_pending_body_in_all_delivery_paths",
+}
+_LINE_ONLY_REPLACEMENTS = {
+    "test_read_config_allows_line_only_without_lineworks_webhook",
+    "test_lineworks_disabled_routes_errors_directly_to_email",
+    "test_lineworks_disabled_sends_line_only_and_discards_stale_lineworks_alert",
+    "test_migrate_v3_removes_lineworks_delivery_and_recovery_state",
+}
+for _test_name, _test_method in list(vars(RetanakaXserverBotTests).items()):
+    if _test_name in _LINE_ONLY_REPLACEMENTS:
+        continue
+    if "lineworks" in _test_name or "webhook" in _test_name or _test_name in _REMOVED_LINEWORKS_TESTS:
+        setattr(
+            RetanakaXserverBotTests,
+            _test_name,
+            unittest.skip("LINE WORKS support was removed; covered by LINE-only replacements")(_test_method),
+        )
 
 
 if __name__ == "__main__":

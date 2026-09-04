@@ -4,7 +4,6 @@
 
 次の値は実値をリポジトリ、`public_html`、ログへ保存しないでください。
 
-- LINE WORKS Incoming Webhook URL
 - LINE Messaging APIのアクセストークンとグループID
 - ScreenshotOne APIキー
 - Xserver APIキー、FTP/FTPSパスワード
@@ -31,9 +30,7 @@
 ## 通知ポリシー
 
 - LINEは当日の最初の新しい発表だけ送信する
-- LINE WORKSは発表時刻が新しくなるたびに送信する
-- `--test-lineworks-only` はLINE WORKSだけへ送信し、通常の観測・履歴・配信状態を変更しない
-- 通常の運用エラーと復旧はLINE WORKSへ通知する。LINE WORKS送信障害、またはLINE WORKSへエラー・復旧通知を送れない場合だけメールへフォールバックする
+- Xserver版の通常運用エラーと復旧はメールで通知する
 - エラー通知の技術情報は、設定済みのトークン、Webhook、APIキー、グループID、メールアドレスを伏字にしてから通知先と非公開状態ファイルへ保存する
 - メールで送る復旧通知は元のエラー通知を引用し、返信ヘッダを付けて1回だけ送信する
 

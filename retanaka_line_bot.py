@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch Tanaka recycle prices and send a daily LINE WORKS message."""
+"""Fetch Tanaka recycle prices and send the first daily update to LINE."""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ from urllib.request import Request, urlopen
 
 PRICE_URL = "https://gold.tanaka.co.jp/retanaka/price/"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
-LINEWORKS_WEBHOOK_PREFIX = "https://webhook.worksmobile.com/message/"
 DEFAULT_STATE_PATH = Path(__file__).resolve().parent / "data" / "retanaka_price_state.json"
 DEFAULT_ENV_PATH = Path(__file__).resolve().parent / ".retanaka.env"
 MAX_HISTORY = 90
@@ -148,7 +147,7 @@ def parse_snapshot(html: str) -> PriceSnapshot:
 
 def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"history": [], "deliveries": {"line": {}, "lineworks": {}}}
+        return {"history": [], "deliveries": {"line": {}}}
 
     data = json.loads(path.read_text(encoding="utf-8"))
     history = data.get("history")
@@ -169,14 +168,7 @@ def load_state(path: Path) -> dict[str, Any]:
         raw_deliveries = {}
 
     line = _normalize_delivery(raw_deliveries.get("line"), include_date=True)
-    lineworks = _normalize_delivery(raw_deliveries.get("lineworks"))
-
-    # The legacy marker belonged to the previous LINE WORKS-only implementation.
-    legacy_last_sent = data.get("last_sent_published_at")
-    if not lineworks and isinstance(legacy_last_sent, str):
-        lineworks["last_sent_published_at"] = legacy_last_sent
-
-    return {"history": normalized_history, "deliveries": {"line": line, "lineworks": lineworks}}
+    return {"history": normalized_history, "deliveries": {"line": line}}
 
 
 def _normalize_delivery(value: Any, *, include_date: bool = False) -> dict[str, str]:
@@ -332,45 +324,6 @@ def send_line_message(channel_access_token: str, group_id: str, message: str) ->
         raise RuntimeError(f"LINE Push API接続エラー: {exc}") from exc
 
 
-def build_lineworks_payload(message: str, button_url: str = PRICE_URL) -> dict[str, Any]:
-    body_text = message
-    heading = "【田中貴金属 リサイクル価格】"
-    if body_text.startswith(heading):
-        body_text = body_text[len(heading) :].lstrip("\r\n")
-    return {
-        "title": "RE:TANAKA価格",
-        "body": {"text": body_text},
-        "button": {
-            "label": "価格ページを開く",
-            "url": button_url,
-        },
-    }
-
-
-def send_lineworks_message(webhook_url: str, message: str, button_url: str = PRICE_URL) -> None:
-    ssl_context = build_ssl_context()
-    payload = build_lineworks_payload(message, button_url)
-
-    request = Request(
-        webhook_url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "retanaka-lineworks-bot/1.0",
-        },
-    )
-
-    try:
-        with urlopen(request, timeout=30, context=ssl_context):
-            return
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LINE WORKS Webhookエラー: HTTP {exc.code}: {body}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"LINE WORKS Webhook接続エラー: {exc}") from exc
-
-
 def build_ssl_context() -> ssl.SSLContext:
     try:
         import certifi
@@ -384,11 +337,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="送信せず、メッセージ内容のみ出力")
     parser.add_argument("--force-send", action="store_true", help="同一発表時刻でも送信を強制")
-    parser.add_argument(
-        "--test-lineworks-only",
-        action="store_true",
-        help="LINE WORKSだけにテストメッセージを送信（価格取得・状態更新なし）",
-    )
     parser.add_argument("--state-path", default=str(DEFAULT_STATE_PATH), help="状態ファイルの保存先")
     parser.add_argument("--env-file", default=str(DEFAULT_ENV_PATH), help="環境変数ファイルのパス")
     return parser.parse_args(argv)
@@ -404,28 +352,11 @@ def _line_is_due(line_state: dict[str, str], published_at: str) -> bool:
     return line_state.get("last_sent_date") != published_at[:10]
 
 
-def _lineworks_is_due(lineworks_state: dict[str, str], published_at: str) -> bool:
-    return _is_newer_than_last_sent(published_at, lineworks_state.get("last_sent_published_at"))
-
-
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
     env_file = Path(args.env_file)
     load_env_file(env_file)
-
-    webhook_url = os.getenv("LINEWORKS_WEBHOOK_URL", "").strip()
-    if args.test_lineworks_only:
-        if not webhook_url.startswith(LINEWORKS_WEBHOOK_PREFIX):
-            print("LINEWORKS_WEBHOOK_URL が正しく設定されていません", file=sys.stderr)
-            return 2
-        try:
-            send_lineworks_message(webhook_url, "RE:TANAKA LINE WORKS テスト送信")
-        except Exception as exc:  # pragma: no cover
-            print(f"LINE WORKSテスト送信に失敗しました: {exc}", file=sys.stderr)
-            return 1
-        print("LINE WORKSテスト送信完了")
-        return 0
 
     state_path = Path(args.state_path)
     with state_lock(state_path) as acquired:
@@ -454,7 +385,6 @@ def main(argv: list[str] | None = None) -> int:
 
         deliveries = state["deliveries"]
         line_state = deliveries["line"]
-        lineworks_state = deliveries["lineworks"]
         errors: list[str] = []
         delivered_channels: list[str] = []
 
@@ -473,19 +403,6 @@ def main(argv: list[str] | None = None) -> int:
                     line_state["last_sent_date"] = current.published_at[:10]
                     save_state(state_path, state)
                     delivered_channels.append("LINE")
-
-        if args.force_send or _lineworks_is_due(lineworks_state, current.published_at):
-            if not webhook_url.startswith(LINEWORKS_WEBHOOK_PREFIX):
-                errors.append("LINEWORKS_WEBHOOK_URL が正しく設定されていません")
-            else:
-                try:
-                    send_lineworks_message(webhook_url, message)
-                except Exception as exc:  # pragma: no cover
-                    errors.append(f"LINE WORKS送信に失敗しました: {exc}")
-                else:
-                    lineworks_state["last_sent_published_at"] = current.published_at
-                    save_state(state_path, state)
-                    delivered_channels.append("LINE WORKS")
 
         save_state(state_path, state)
 

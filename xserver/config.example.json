@@ -1,7 +1,6 @@
 {
   "line_channel_access_token": "YOUR_LINE_CHANNEL_ACCESS_TOKEN",
   "line_group_id": "YOUR_LINE_GROUP_ID",
-  "lineworks_webhook_url": "YOUR_LINEWORKS_WEBHOOK_URL",
   "alert_email": "YOUR_ALERT_EMAIL",
   "alert_email_from": "YOUR_ALERT_EMAIL_FROM",
   "sendmail_path": "/usr/sbin/sendmail",

@@ -3,9 +3,8 @@
 Xserver共用サーバーのCronからRE:TANAKA価格を毎分確認します。
 
 - LINE: 当日の最初の新しい発表を1回だけ通知
-- LINE WORKS: 新しい発表ごとに通知
 - K24特定品、Pt特定品、銀(999)、前回営業日比、発表日時を通知
-- 価格表画像を生成した場合、LINE WORKSには公開URLのリンクボタンを付け、LINEには画像として添付
+- 価格表画像を生成した場合、LINEには画像として添付
 
 ## ディレクトリ
 
@@ -26,7 +25,7 @@ Xserver共用サーバーのCronからRE:TANAKA価格を毎分確認します。
 /home/YOUR_ACCOUNT/YOUR_DOMAIN/public_html/retanaka-bot-images/
 ~~~
 
-`public_html` 配下はインターネットから閲覧できます。公開領域には生成したランダム名の価格表画像だけを置き、Webhook URL、APIキー、トークン、グループID、メールアドレス、個人情報、コード、設定、状態、ログは保存しません。
+`public_html` 配下はインターネットから閲覧できます。公開領域には生成したランダム名の価格表画像だけを置き、APIキー、トークン、グループID、メールアドレス、個人情報、コード、設定、状態、ログは保存しません。
 
 ## 設定
 
@@ -34,7 +33,7 @@ Xserver共用サーバーのCronからRE:TANAKA価格を毎分確認します。
 
 設定名は実装と一致させてください。
 
-- 配信: `line_channel_access_token`, `line_group_id`, `lineworks_webhook_url`
+- 配信: `line_channel_access_token`, `line_group_id`
 - 価格・状態: `price_url`, `timezone`, `state_file`, `lock_file`
 - アラート: `alert_email`, `alert_email_from`, `sendmail_path`
 - 画像: `enable_section_screenshot`, `require_screenshot`, `screenshot_api_url`, `screenshotone_access_key`, `screenshot_public_dir`, `screenshot_public_base_url`, `screenshot_selector`, `screenshot_wait_for_selector`, `screenshot_hide_selectors`, `screenshot_retention_hours`, `screenshot_delete_after_seconds`
@@ -65,14 +64,6 @@ cron.log                                              600
   --dry-run
 ~~~
 
-LINE WORKSだけを1回テスト送信し、通常の状態を変更しない:
-
-~~~bash
-/usr/bin/python3.6 /home/YOUR_ACCOUNT/ops/retanaka-bot/retanaka_xserver_bot.py \
-  --config /home/YOUR_ACCOUNT/ops/retanaka-bot/config.json \
-  --test-lineworks-only
-~~~
-
 同じ発表時刻でも送信を強制する場合:
 
 ~~~bash
@@ -89,6 +80,6 @@ LINE WORKSだけを1回テスト送信し、通常の状態を変更しない:
 * * * * * /usr/bin/python3.6 /home/YOUR_ACCOUNT/ops/retanaka-bot/retanaka_xserver_bot.py --config /home/YOUR_ACCOUNT/ops/retanaka-bot/config.json >> /home/YOUR_ACCOUNT/ops/retanaka-bot/cron.log 2>&1
 ~~~
 
-発表時刻は状態ファイルで管理します。LINEは当日最初の発表だけ、LINE WORKSは新しい発表ごとに送信し、プロセスロックで重複実行を防ぎます。
+発表時刻は状態ファイルで管理します。LINEは当日最初の発表だけ送信し、プロセスロックで重複実行を防ぎます。
 
-通常の運用エラーと復旧はLINE WORKSへ通知する。LINE WORKS送信障害、またはLINE WORKSへエラー・復旧通知を送れない場合だけメールへフォールバックする。本文には原因、BOTの動作、必要な対応、伏字済みの技術情報を含めます。メールで送る復旧通知は元のエラー通知を `>` で引用し、返信ヘッダを付けて1回送ります。復旧後に同じ障害が再発した場合は、新しい障害として再度通知します。
+通常の運用エラーと復旧はメールで通知します。本文には原因、BOTの動作、必要な対応、伏字済みの技術情報を含めます。復旧通知は元のエラー通知を `>` で引用し、返信ヘッダを付けて1回送ります。復旧後に同じ障害が再発した場合は、新しい障害として再度通知します。

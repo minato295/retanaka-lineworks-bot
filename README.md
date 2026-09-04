@@ -1,15 +1,14 @@
-# RE:TANAKA価格 LINE / LINE WORKS配信
+# RE:TANAKA価格 LINE配信
 
 田中貴金属のRE:TANAKA価格を取得し、次のルールで通知します。
 
-- LINE: 当日の最初の新しい発表を1回だけ送信
-- LINE WORKS: 新しい発表ごとに送信
+- LINEへ当日の最初の新しい発表を1回だけ送信
 - K24特定品、Pt特定品、銀(999)のリサイクル価格 (円/g)
 - 発表日時と前回営業日比
 
-Xserver版では、価格表のスクリーンショットを生成し、LINE WORKSには公開画像へのリンクボタン、LINEには画像メッセージとして添付します。
+Xserver版では、価格表のスクリーンショットを生成し、LINEへ画像メッセージとして添付します。
 
-通常の運用エラーと復旧はLINE WORKSへ通知する。LINE WORKS送信障害、またはLINE WORKSへエラー・復旧通知を送れない場合だけメールへフォールバックする。通知本文には原因、BOTの動作、必要な対応、伏字済みの技術情報を含めます。
+Xserver版の通常運用では、エラーと復旧をメールで通知します。通知本文には原因、BOTの動作、必要な対応、伏字済みの技術情報を含めます。ローカル実行版は標準エラー出力へ記録します。
 
 ## ローカル設定
 
@@ -22,7 +21,6 @@ cp .retanaka.env.example .retanaka.env
 ~~~dotenv
 LINE_CHANNEL_ACCESS_TOKEN=YOUR_LINE_CHANNEL_ACCESS_TOKEN
 LINE_GROUP_ID=YOUR_LINE_GROUP_ID
-LINEWORKS_WEBHOOK_URL=YOUR_LINEWORKS_WEBHOOK_URL
 ~~~
 
 ## 実行
@@ -31,12 +29,6 @@ LINEWORKS_WEBHOOK_URL=YOUR_LINEWORKS_WEBHOOK_URL
 
 ~~~bash
 python3 retanaka_line_bot.py --dry-run
-~~~
-
-LINE WORKSだけを確認送信し、通常の状態を変更しない:
-
-~~~bash
-python3 retanaka_line_bot.py --test-lineworks-only
 ~~~
 
 通常送信:

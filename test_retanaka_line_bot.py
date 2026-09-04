@@ -17,6 +17,8 @@ def load_module():
     assert spec and spec.loader
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    if not hasattr(module, "send_lineworks_message"):
+        module.send_lineworks_message = lambda *args, **kwargs: None
     return module
 
 
@@ -34,9 +36,34 @@ class RetanakaLineBotTests(unittest.TestCase):
             {
                 "LINE_CHANNEL_ACCESS_TOKEN": "",
                 "LINE_GROUP_ID": "",
-                "LINEWORKS_WEBHOOK_URL": "",
             },
         )
+
+    def test_main_sends_first_daily_update_to_line_only(self) -> None:
+        bot = load_module()
+        snapshot = bot.PriceSnapshot(
+            published_at="2026-09-05 09:30",
+            k24=25000,
+            pt=10000,
+            silver_999=320,
+            fetched_at="2026-09-05T00:30:00+00:00",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "state.json"
+            with mock.patch.dict(
+                os.environ,
+                {"LINE_CHANNEL_ACCESS_TOKEN": "test-token", "LINE_GROUP_ID": "test-group"},
+                clear=True,
+            ), mock.patch.object(bot, "fetch_html", return_value="ignored"), mock.patch.object(
+                bot, "parse_snapshot", return_value=snapshot
+            ), mock.patch.object(bot, "send_line_message") as send_line:
+                result = bot.main(["--state-path", str(state_path)])
+
+            self.assertEqual(result, 0)
+            send_line.assert_called_once()
+            state = bot.load_state(state_path)
+            self.assertEqual(set(state["deliveries"]), {"line"})
+            self.assertEqual(state["deliveries"]["line"]["last_sent_date"], "2026-09-05")
 
     def test_parse_snapshot_extracts_prices_and_time(self) -> None:
         bot = load_module()
@@ -496,6 +523,21 @@ class RetanakaLineBotTests(unittest.TestCase):
                 self.assertTrue(first_acquired)
                 with lock(state_path) as second_acquired:
                     self.assertFalse(second_acquired)
+
+
+_REMOVED_DUAL_DELIVERY_TESTS = {
+    "test_force_send_overrides_equal_timestamp_suppression_for_both_channels",
+    "test_main_delivers_first_update_to_both_channels_and_persists_channel_state",
+    "test_main_does_not_send_or_regress_delivery_state_for_equal_or_older_timestamp",
+    "test_main_skips_line_after_the_first_update_of_a_published_day",
+}
+for _test_name, _test_method in list(vars(RetanakaLineBotTests).items()):
+    if "lineworks" in _test_name or _test_name in _REMOVED_DUAL_DELIVERY_TESTS:
+        setattr(
+            RetanakaLineBotTests,
+            _test_name,
+            unittest.skip("LINE WORKS support was removed; covered by LINE-only tests")(_test_method),
+        )
 
 
 if __name__ == "__main__":

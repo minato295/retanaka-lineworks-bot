@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Xserver Cron runner for Tanaka recycle prices -> LINE WORKS Incoming Webhook.
+"""Xserver Cron runner for Tanaka recycle prices -> LINE.
 
 Python 3.6+ (Xserver shared hosting compatible) / standard library only.
 """
@@ -31,7 +31,6 @@ from urllib.request import Request, urlopen
 
 DEFAULT_PRICE_URL = "https://gold.tanaka.co.jp/retanaka/price/"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
-LINEWORKS_WEBHOOK_PREFIX = "https://webhook.worksmobile.com/message/"
 SCREENSHOT_API_URL = "https://api.screenshotone.com/take"
 DEFAULT_SECTION_SELECTOR = "#contents article > section"
 DEFAULT_WAIT_SELECTOR = "#price_tables"
@@ -58,16 +57,13 @@ class PriceSnapshot(NamedTuple):
 
 def make_empty_state():
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "history": [],
         "last_observed_published_at": None,
         "deliveries": {
             "line": {
                 "last_sent_published_at": None,
                 "last_sent_date": None,
-            },
-            "lineworks": {
-                "last_sent_published_at": None,
             },
         },
         "error_alert_dates": {},
@@ -83,9 +79,8 @@ def parse_args(argv):
         default=str(Path(__file__).resolve().parent / "config.json"),
         help="config JSON path (default: ./config.json)",
     )
-    parser.add_argument("--dry-run", action="store_true", help="LINE WORKS送信せず通知内容のみ出力")
+    parser.add_argument("--dry-run", action="store_true", help="送信せず通知内容のみ出力")
     parser.add_argument("--force-send", action="store_true", help="同一発表時刻でも送信")
-    parser.add_argument("--test-lineworks-only", action="store_true", help="状態を変更せずLINE WORKSだけに送信")
     return parser.parse_args(argv)
 
 
@@ -120,7 +115,6 @@ def read_alert_config_only(path):
         "alert_email_from": "retanaka-bot@localhost",
         "sendmail_path": "/usr/sbin/sendmail",
         "state_file": str(default_state),
-        "lineworks_webhook_url": "",
         "price_url": DEFAULT_PRICE_URL,
     }
 
@@ -141,9 +135,6 @@ def read_alert_config_only(path):
     )
     config["sendmail_path"] = str(data.get("sendmail_path", "/usr/sbin/sendmail")).strip() or "/usr/sbin/sendmail"
     config["state_file"] = normalize_path(config_dir, data.get("state_file"), str(default_state))
-    webhook_url = str(data.get("lineworks_webhook_url", "")).strip()
-    if webhook_url.startswith(LINEWORKS_WEBHOOK_PREFIX):
-        config["lineworks_webhook_url"] = webhook_url
     config["price_url"] = str(data.get("price_url", DEFAULT_PRICE_URL)).strip() or DEFAULT_PRICE_URL
     return config
 
@@ -161,16 +152,6 @@ def read_config(path):
 
     if not isinstance(config, dict):
         raise RuntimeError("config root must be object")
-
-    required = ["lineworks_webhook_url"]
-    for key in required:
-        value = str(config.get(key, "")).strip()
-        if not value:
-            raise RuntimeError("missing required config key: {0}".format(key))
-        config[key] = value
-
-    if not config["lineworks_webhook_url"].startswith(LINEWORKS_WEBHOOK_PREFIX):
-        raise RuntimeError("lineworks_webhook_url must start with {0}".format(LINEWORKS_WEBHOOK_PREFIX))
 
     line_token = str(config.get("line_channel_access_token", "")).strip()
     line_group_id = str(config.get("line_group_id", "")).strip()
@@ -400,22 +381,12 @@ def migrate_state(data):
     raw_line = deliveries.get("line")
     if not isinstance(raw_line, dict):
         raw_line = {}
-    raw_lineworks = deliveries.get("lineworks")
-    if not isinstance(raw_lineworks, dict):
-        raw_lineworks = {}
-
     line_last_sent_date = raw_line.get("last_sent_date", data.get("line_last_sent_date"))
     if not isinstance(line_last_sent_date, str):
         line_last_sent_date = None
     line_last_sent_published_at = raw_line.get("last_sent_published_at")
     if not isinstance(line_last_sent_published_at, str):
         line_last_sent_published_at = None
-    lineworks_last_sent_published_at = raw_lineworks.get(
-        "last_sent_published_at", data.get("lineworks_last_sent_published_at")
-    )
-    if not isinstance(lineworks_last_sent_published_at, str):
-        legacy_last_sent = data.get("last_sent_published_at")
-        lineworks_last_sent_published_at = legacy_last_sent if isinstance(legacy_last_sent, str) else None
     last_observed_published_at = data.get("last_observed_published_at")
     if not isinstance(last_observed_published_at, str):
         last_observed_published_at = None
@@ -424,26 +395,26 @@ def migrate_state(data):
         raw_error_alert_dates = {}
     error_alert_dates = {}
     for key, value in raw_error_alert_dates.items():
-        if isinstance(key, str) and isinstance(value, str):
+        if isinstance(key, str) and isinstance(value, str) and key != "lineworks_delivery_error":
             error_alert_dates[key] = value
     raw_pending_recovery_alerts = data.get("pending_recovery_alerts")
     if not isinstance(raw_pending_recovery_alerts, dict):
         raw_pending_recovery_alerts = {}
     pending_recovery_alerts = {}
-    is_legacy_schema = source_schema is None or (
-        type(source_schema) is int and source_schema <= 2
-    )
     for key, value in raw_pending_recovery_alerts.items():
         if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        if key == "lineworks_delivery_error":
             continue
         subject = value.get("subject")
         body = value.get("body")
         message_id = value.get("message_id")
         occurred_at = value.get("occurred_at")
         transport = value.get("transport")
-        if is_legacy_schema:
+        if source_schema is None or (type(source_schema) is int and source_schema <= 2):
             transport = "email"
-        elif transport not in ("lineworks", "email"):
+        elif transport != "email":
+            error_alert_dates.pop(key, None)
             continue
         if not all(isinstance(item, str) and item for item in (subject, body, occurred_at)):
             continue
@@ -453,9 +424,9 @@ def migrate_state(data):
             "body": body,
             "occurred_at": occurred_at,
         }
-        if transport == "email" and isinstance(message_id, str) and message_id:
+        if isinstance(message_id, str) and message_id:
             pending_alert["message_id"] = message_id
-        elif transport == "email":
+        else:
             continue
         pending_recovery_alerts[key] = pending_alert
     test_email_sent_at = data.get("test_email_sent_at")
@@ -471,8 +442,7 @@ def migrate_state(data):
                 "line": {
                     "last_sent_published_at": line_last_sent_published_at,
                     "last_sent_date": line_last_sent_date,
-                },
-                "lineworks": {"last_sent_published_at": lineworks_last_sent_published_at},
+                }
             },
             "error_alert_dates": error_alert_dates,
             "pending_recovery_alerts": pending_recovery_alerts,
@@ -652,11 +622,6 @@ def should_deliver_line(state, snapshot, today_key):
     )
 
 
-def should_deliver_lineworks(state, snapshot):
-    lineworks_delivery = state.get("deliveries", {}).get("lineworks", {})
-    return lineworks_delivery.get("last_sent_published_at") != snapshot.published_at
-
-
 def is_new_observation(state, snapshot):
     last_observed = state.get("last_observed_published_at")
     return not isinstance(last_observed, str) or snapshot.published_at > last_observed
@@ -811,23 +776,6 @@ def cleanup_old_screenshots(config):
             continue
 
 
-def build_lineworks_payload(text_message, image_url=None, price_url=None):
-    button_url = image_url or price_url or DEFAULT_PRICE_URL
-    button_label = "価格表画像を見る" if image_url else "価格ページを開く"
-    body_text = text_message
-    heading = "【田中貴金属 リサイクル価格】"
-    if body_text.startswith(heading):
-        body_text = body_text[len(heading) :].lstrip("\r\n")
-    return {
-        "title": "RE:TANAKA価格",
-        "body": {"text": body_text},
-        "button": {
-            "label": button_label,
-            "url": button_url,
-        },
-    }
-
-
 def build_line_messages(text_message, image_url=None):
     messages = [{"type": "text", "text": text_message}]
     if image_url:
@@ -925,13 +873,11 @@ def classify_error(error, alert_key=None):
             "bot_action": "次の価格更新時に画像取得を再試行します。",
             "required_action": "繰り返す場合はScreenshotOneの稼働状況、認証情報、利用上限を確認してください。",
         }
-    if alert_key in ("line_delivery_error", "line_limit_error", "lineworks_delivery_error") or any(
-        marker in error_text for marker in ("line api", "line works webhook", "line works")
-    ):
+    if alert_key in ("line_delivery_error", "line_limit_error") or "line api" in error_text:
         return {
             "cause": "通知先サービスが送信要求を受け付けませんでした。",
             "bot_action": "次回の毎分実行で、未送信の通知を自動的に再試行します。",
-            "required_action": "繰り返す場合は通知先の稼働状況、Webhook、認証情報を確認してください。",
+            "required_action": "繰り返す場合はLINEの稼働状況と認証情報を確認してください。",
         }
     if any(
         marker in error_text
@@ -971,7 +917,6 @@ def redact_sensitive_text(value, config=None):
         for key in (
             "line_channel_access_token",
             "line_group_id",
-            "lineworks_webhook_url",
             "screenshotone_access_key",
             "alert_email",
         ):
@@ -1014,22 +959,6 @@ def format_error_alert_body(body_lines, alert_key=None, config=None):
     return "\n".join(formatted_lines)
 
 
-def build_lineworks_fallback_body(body, lineworks_error):
-    quoted_original = "\n".join(
-        "> {0}".format(line) for line in body.splitlines()
-    )
-    return "\n".join(
-        [
-            "LINE WORKSへ通知できなかったためメールへ切り替えました。",
-            "",
-            "LINE WORKSの技術情報: {0}".format(lineworks_error),
-            "",
-            "以下は元の通知です。",
-            quoted_original,
-        ]
-    )
-
-
 def build_recovery_alert_body(original_body):
     quoted_original = "\n".join(
         "> {0}".format(line) for line in original_body.splitlines()
@@ -1059,49 +988,16 @@ def deliver_recovery_alert(config, state, pending_alert):
     pending_alert["body"] = redact_sensitive_text(pending_alert["body"], config)
     body = build_recovery_alert_body(pending_alert["body"])
     subject = "Re: {0}".format(pending_alert["subject"])
-    if pending_alert.get("transport", "email") == "email":
-        message_id = pending_alert["message_id"]
-        return bool(
-            send_alert_email(
-                config,
-                subject,
-                body,
-                in_reply_to=message_id,
-                references=message_id,
-            )
+    message_id = pending_alert["message_id"]
+    return bool(
+        send_alert_email(
+            config,
+            subject,
+            body,
+            in_reply_to=message_id,
+            references=message_id,
         )
-
-    try:
-        send_lineworks_webhook(
-            config["lineworks_webhook_url"],
-            build_lineworks_alert_payload(subject, body, config),
-        )
-        try:
-            maybe_send_recovery_alert(config, state, "lineworks_delivery_error")
-        except Exception as recovery_error:
-            safe_error = redact_sensitive_text(recovery_error, config)
-            print("LINE WORKS復旧メール送信に失敗しました: {0}".format(safe_error), file=sys.stderr)
-        return True
-    except Exception as lineworks_error:
-        fallback_body = build_lineworks_fallback_body(
-            body, redact_sensitive_text(lineworks_error, config)
-        )
-        message_id = send_alert_email(
-            config, "RE:TANAKA BOT: LINE WORKS送信エラー", fallback_body
-        )
-        pending_alerts = state.get("pending_recovery_alerts")
-        if not isinstance(pending_alerts, dict):
-            pending_alerts = {}
-            state["pending_recovery_alerts"] = pending_alerts
-        if message_id and "lineworks_delivery_error" not in pending_alerts:
-            pending_alerts["lineworks_delivery_error"] = {
-                "transport": "email",
-                "subject": "RE:TANAKA BOT: LINE WORKS送信エラー",
-                "body": fallback_body,
-                "message_id": message_id,
-                "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        return bool(message_id)
+    )
 
 
 def maybe_send_recovery_alert(config, state, alert_key):
@@ -1141,51 +1037,10 @@ def mark_error_alert_sent(state, alert_key, today_key):
     alert_dates[alert_key] = today_key
 
 
-def build_lineworks_alert_payload(subject, body, config):
-    payload = build_lineworks_payload(
-        body, None, config.get("price_url") or DEFAULT_PRICE_URL
-    )
-    payload["title"] = subject
-    return payload
-
-
 def deliver_error_alert(config, state, alert_key, subject, body):
     body = redact_sensitive_text(body, config)
-    if alert_key == "lineworks_delivery_error":
-        message_id = send_alert_email(config, subject, body)
-        return {"transport": "email", "message_id": message_id} if message_id else False
-
-    try:
-        send_lineworks_webhook(
-            config["lineworks_webhook_url"],
-            build_lineworks_alert_payload(subject, body, config),
-        )
-        try:
-            maybe_send_recovery_alert(config, state, "lineworks_delivery_error")
-        except Exception as recovery_error:
-            safe_error = redact_sensitive_text(recovery_error, config)
-            print("LINE WORKS復旧メール送信に失敗しました: {0}".format(safe_error), file=sys.stderr)
-        return {"transport": "lineworks"}
-    except Exception as lineworks_error:
-        fallback_body = build_lineworks_fallback_body(
-            body, redact_sensitive_text(lineworks_error, config)
-        )
-        message_id = send_alert_email(
-            config, "RE:TANAKA BOT: LINE WORKS送信エラー", fallback_body
-        )
-        pending_alerts = state.get("pending_recovery_alerts")
-        if not isinstance(pending_alerts, dict):
-            pending_alerts = {}
-            state["pending_recovery_alerts"] = pending_alerts
-        if message_id and "lineworks_delivery_error" not in pending_alerts:
-            pending_alerts["lineworks_delivery_error"] = {
-                "transport": "email",
-                "subject": "RE:TANAKA BOT: LINE WORKS送信エラー",
-                "body": fallback_body,
-                "message_id": message_id,
-                "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        return {"transport": "email", "message_id": message_id} if message_id else False
+    message_id = send_alert_email(config, subject, body)
+    return {"transport": "email", "message_id": message_id} if message_id else False
 
 
 def maybe_send_error_alert(config, state, alert_key, subject, body_lines):
@@ -1208,8 +1063,7 @@ def maybe_send_error_alert(config, state, alert_key, subject, body_lines):
         "body": body,
         "occurred_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    if delivery["transport"] == "email":
-        pending["message_id"] = delivery["message_id"]
+    pending["message_id"] = delivery["message_id"]
     if alert_key not in pending_alerts:
         pending_alerts[alert_key] = pending
     return True
@@ -1244,15 +1098,12 @@ def is_line_limit_error(error):
 
 
 def maybe_send_delivery_error_alert(config, state, channel, error, published_at):
-    if channel == "line" and is_line_limit_error(error):
+    if is_line_limit_error(error):
         alert_key = "line_limit_error"
         subject = "RE:TANAKA BOT: LINE送信上限エラー"
-    elif channel == "line":
+    else:
         alert_key = "line_delivery_error"
         subject = "RE:TANAKA BOT: LINE送信エラー"
-    else:
-        alert_key = "lineworks_delivery_error"
-        subject = "RE:TANAKA BOT: LINE WORKS送信エラー"
 
     return maybe_send_error_alert(
         config,
@@ -1260,37 +1111,13 @@ def maybe_send_delivery_error_alert(config, state, channel, error, published_at)
         alert_key,
         subject,
         [
-            "RE:TANAKA BOT の{0}送信でエラーが発生しました。".format(
-                "LINE" if channel == "line" else "LINE WORKS"
-            ),
+            "RE:TANAKA BOT のLINE送信でエラーが発生しました。",
             "",
             "日時: {0}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             "対象発表時刻: {0}".format(published_at),
             "エラー: {0}".format(error),
         ],
     )
-
-
-def send_lineworks_webhook(webhook_url, payload):
-    request = Request(
-        webhook_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "retanaka-lineworks-bot/1.0",
-        },
-        method="POST",
-    )
-
-    context = build_ssl_context()
-    try:
-        with urlopen(request, timeout=30, context=context):
-            return
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError("LINE WORKS Webhookエラー: HTTP {0}: {1}".format(exc.code, body))
-    except URLError as exc:
-        raise RuntimeError("LINE WORKS Webhook接続エラー: {0}".format(exc))
 
 
 def send_line_messages(token, group_id, messages):
@@ -1348,7 +1175,7 @@ def _run(argv, preloaded_config=None):
     except Exception as exc:
         safe_error = redact_sensitive_text(exc, alert_config)
         print("設定読み込みに失敗しました: {0}".format(safe_error), file=sys.stderr)
-        if not args.dry_run and not args.test_lineworks_only:
+        if not args.dry_run:
             try:
                 if maybe_send_error_alert(
                     alert_config,
@@ -1378,7 +1205,7 @@ def _run(argv, preloaded_config=None):
         return 2
 
     state = load_state(config["state_file"])
-    if not args.dry_run and not args.test_lineworks_only:
+    if not args.dry_run:
         try:
             if maybe_send_recovery_alert(config, state, "config_error"):
                 print("設定読み込みエラーからの復旧通知を送信しました", file=sys.stderr)
@@ -1410,7 +1237,7 @@ def _run(argv, preloaded_config=None):
     except Exception as exc:
         safe_error = redact_sensitive_text(exc, config)
         print("価格取得に失敗しました: {0}".format(safe_error), file=sys.stderr)
-        if not args.dry_run and not args.test_lineworks_only:
+        if not args.dry_run:
             try:
                 if maybe_send_error_alert(
                     config,
@@ -1436,7 +1263,7 @@ def _run(argv, preloaded_config=None):
             save_state(config["state_file"], state)
         return 1
 
-    if not args.dry_run and not args.test_lineworks_only:
+    if not args.dry_run:
         try:
             if maybe_send_recovery_alert(config, state, "price_fetch_error"):
                 print("価格取得エラーからの復旧通知を送信しました", file=sys.stderr)
@@ -1453,39 +1280,11 @@ def _run(argv, preloaded_config=None):
     message = build_message(current, previous_day, config["price_url"])
     published_date_key = datetime.strptime(current.published_at, INTERNAL_TS_FORMAT).strftime("%Y-%m-%d")
 
-    if args.test_lineworks_only:
-        screenshot_url = None
-        if config.get("enable_section_screenshot", False):
-            try:
-                _, screenshot_url = capture_screenshot_if_enabled(config, current)
-            except Exception as exc:
-                safe_error = redact_sensitive_text(exc, config)
-                if config.get("require_screenshot", True):
-                    print("LINE WORKS限定テスト用スクリーンショット取得に失敗しました: {0}".format(safe_error), file=sys.stderr)
-                    return 1
-                print("LINE WORKS限定テスト用スクリーンショット取得に失敗しました: {0}".format(safe_error), file=sys.stderr)
-        try:
-            send_lineworks_webhook(
-                config["lineworks_webhook_url"],
-                build_lineworks_payload(message, screenshot_url, config["price_url"]),
-            )
-        except Exception as exc:
-            print(
-                "LINE WORKS限定テスト送信に失敗しました: {0}".format(
-                    redact_sensitive_text(exc, config)
-                ),
-                file=sys.stderr,
-            )
-            return 1
-        print("LINE WORKS限定テスト送信完了")
-        return 0
-
     if not args.force_send:
         if state.get("last_observed_published_at") is None:
             if not args.dry_run:
                 upsert_history(state, current)
                 state["last_observed_published_at"] = current.published_at
-                state["deliveries"]["lineworks"]["last_sent_published_at"] = current.published_at
                 if published_date_key == today_key and config.get("line_channel_access_token"):
                     state["deliveries"]["line"]["last_sent_published_at"] = current.published_at
                     state["deliveries"]["line"]["last_sent_date"] = today_key
@@ -1506,10 +1305,6 @@ def _run(argv, preloaded_config=None):
     send_line = bool(config.get("line_channel_access_token")) and (
         args.force_send or (observation_is_new or observation_is_equal) and should_deliver_line(state, current, today_key)
     )
-    send_lineworks = args.force_send or (
-        (observation_is_new or observation_is_equal) and should_deliver_lineworks(state, current)
-    )
-
     screenshot_url = None
     screenshot_path = None
     screenshot_error = None
@@ -1518,8 +1313,6 @@ def _run(argv, preloaded_config=None):
         print(message)
         if not send_line:
             print("通常実行時はLINE送信をスキップします")
-        if not send_lineworks:
-            print("通常実行時はLINE WORKS送信をスキップします")
         if config.get("enable_section_screenshot", False):
             try:
                 screenshot_path, screenshot_url = capture_screenshot_if_enabled(config, current)
@@ -1536,7 +1329,7 @@ def _run(argv, preloaded_config=None):
             return 1
         return 0
 
-    if not send_line and not send_lineworks:
+    if not send_line:
         print("送信対象の新しい発表ではないため送信をスキップしました")
         save_state(config["state_file"], state)
         return 0
@@ -1648,40 +1441,6 @@ def _run(argv, preloaded_config=None):
             except Exception as recovery_exc:
                 print(
                     "LINE送信エラーからの復旧通知送信に失敗しました: {0}".format(
-                        redact_sensitive_text(recovery_exc, config)
-                    ),
-                    file=sys.stderr,
-                )
-            save_state(config["state_file"], state)
-
-    if send_lineworks:
-        try:
-            send_lineworks_webhook(
-                config["lineworks_webhook_url"],
-                build_lineworks_payload(message, screenshot_url, config["price_url"]),
-            )
-        except Exception as exc:
-            delivery_failed = True
-            safe_error = redact_sensitive_text(exc, config)
-            print("LINE WORKS送信に失敗しました: {0}".format(safe_error), file=sys.stderr)
-            try:
-                if maybe_send_delivery_error_alert(config, state, "lineworks", safe_error, current.published_at):
-                    save_state(config["state_file"], state)
-            except Exception as alert_exc:
-                print(
-                    "LINE WORKS送信エラー通知メール送信に失敗しました: {0}".format(
-                        redact_sensitive_text(alert_exc, config)
-                    ),
-                    file=sys.stderr,
-                )
-        else:
-            state["deliveries"]["lineworks"]["last_sent_published_at"] = current.published_at
-            try:
-                if maybe_send_recovery_alert(config, state, "lineworks_delivery_error"):
-                    print("LINE WORKS送信エラーからの復旧通知メールを送信しました", file=sys.stderr)
-            except Exception as recovery_exc:
-                print(
-                    "LINE WORKS送信エラーからの復旧通知メール送信に失敗しました: {0}".format(
                         redact_sensitive_text(recovery_exc, config)
                     ),
                     file=sys.stderr,
