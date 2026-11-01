@@ -8,6 +8,13 @@
   "state_file": "/home/YOUR_ACCOUNT/ops/retanaka-bot/storage/retanaka_price_state.json",
   "lock_file": "/home/YOUR_ACCOUNT/ops/retanaka-bot/storage/retanaka_price.lock",
   "timezone": "Asia/Tokyo",
+  "shift_reminder": {
+    "enabled": false,
+    "users": {
+      "user1": "YOUR_FIRST_LINE_USER_ID",
+      "user2": "YOUR_SECOND_LINE_USER_ID"
+    }
+  },
 
   "enable_section_screenshot": true,
   "require_screenshot": true,

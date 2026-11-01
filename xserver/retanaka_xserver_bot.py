@@ -17,8 +17,9 @@ import subprocess
 import sys
 import tempfile
 import time as time_module
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.header import Header
 from email.mime.text import MIMEText
 from email.utils import make_msgid
@@ -69,6 +70,7 @@ def make_empty_state():
         "error_alert_dates": {},
         "pending_recovery_alerts": {},
         "test_email_sent_at": None,
+        "shift_reminder_month": None,
     }
 
 
@@ -447,6 +449,7 @@ def migrate_state(data):
             "error_alert_dates": error_alert_dates,
             "pending_recovery_alerts": pending_recovery_alerts,
             "test_email_sent_at": test_email_sent_at,
+            "shift_reminder_month": data.get("shift_reminder_month"),
         }
     )
     return state
@@ -914,8 +917,15 @@ def classify_error(error, alert_key=None):
 def redact_sensitive_text(value, config=None):
     text = str(value)
     if isinstance(config, dict):
+        reminder = config.get("shift_reminder")
+        users = reminder.get("users") if isinstance(reminder, dict) else None
+        if isinstance(users, dict):
+            for user_id in users.values():
+                if isinstance(user_id, str) and len(user_id) >= 4:
+                    text = text.replace(user_id, "[伏字]")
         for key in (
             "line_channel_access_token",
+            "line_channel_secret",
             "line_group_id",
             "screenshotone_access_key",
             "alert_email",
@@ -1120,7 +1130,54 @@ def maybe_send_delivery_error_alert(config, state, channel, error, published_at)
     )
 
 
-def send_line_messages(token, group_id, messages):
+def build_mention_message(text, users):
+    substitution = {}
+    for key, user_id in users.items():
+        if not re.fullmatch(r"[0-9A-Za-z_]{1,20}", key):
+            raise ValueError("invalid mention placeholder")
+        if not re.fullmatch(r"U[0-9a-fA-F]{32}", user_id):
+            raise ValueError("invalid mention user ID")
+        substitution[key] = {
+            "type": "mention",
+            "mentionee": {"type": "user", "userId": user_id},
+        }
+    return {"type": "textV2", "text": text, "substitution": substitution}
+
+
+def maybe_send_shift_reminder(config, state, now):
+    reminder = config.get("shift_reminder")
+    if not isinstance(reminder, dict) or reminder.get("enabled") is not True:
+        return False
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone(timedelta(hours=9)))
+    month = now.strftime("%Y-%m")
+    if now.day != 25 or now.hour != 9 or state.get("shift_reminder_month") == month:
+        return False
+    users = reminder.get("users", {})
+    if not isinstance(users, dict) or set(users) != {"user1", "user2"}:
+        raise ValueError("shift reminder requires two configured users")
+    if len(set(users.values())) != 2:
+        raise ValueError("shift reminder users must be distinct")
+    message = build_mention_message(
+        "{user1} {user2}\n本日はシフト提出期限です。シフトの提出をお願いします。",
+        users,
+    )
+    retry_key = str(uuid.uuid5(uuid.NAMESPACE_URL,
+        "retanaka:shift-reminder:" + config["line_group_id"] + ":" + month))
+    send_line_messages(config["line_channel_access_token"], config["line_group_id"],
+        [message], retry_key=retry_key)
+    state["shift_reminder_month"] = month
+    save_state(config["state_file"], state)
+    try:
+        if maybe_send_recovery_alert(config, state, "shift_reminder_error"):
+            save_state(config["state_file"], state)
+    except Exception as exc:
+        print("シフト提出リマインド復旧通知に失敗しました: {0}".format(
+            redact_sensitive_text(exc, config)), file=sys.stderr)
+    return True
+
+
+def send_line_messages(token, group_id, messages, retry_key=None):
     payload = {"to": group_id, "messages": messages}
     request = Request(
         LINE_PUSH_URL,
@@ -1131,11 +1188,15 @@ def send_line_messages(token, group_id, messages):
         },
         method="POST",
     )
+    if retry_key:
+        request.add_header("X-Line-Retry-Key", retry_key)
     context = build_ssl_context()
     try:
         with urlopen(request, timeout=30, context=context):
             return
     except HTTPError as exc:
+        if retry_key and exc.code == 409 and exc.headers.get("x-line-accepted-request-id"):
+            return
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError("LINE API エラー: HTTP {0}: {1}".format(exc.code, body))
     except URLError as exc:
@@ -1205,6 +1266,21 @@ def _run(argv, preloaded_config=None):
         return 2
 
     state = load_state(config["state_file"])
+    reminder_failed = False
+    if not args.dry_run:
+        try:
+            maybe_send_shift_reminder(config, state, datetime.now(timezone(timedelta(hours=9))))
+        except Exception as exc:
+            reminder_failed = True
+            print("シフト提出リマインド送信に失敗しました: {0}".format(
+                redact_sensitive_text(exc, config)), file=sys.stderr)
+            try:
+                maybe_send_error_alert(config, state, "shift_reminder_error",
+                    "RE:TANAKA BOT: シフト提出リマインドエラー",
+                    ["エラー: {0}".format(exc)])
+                save_state(config["state_file"], state)
+            except Exception:
+                print("リマインドエラー通知に失敗しました", file=sys.stderr)
     if not args.dry_run:
         try:
             if maybe_send_recovery_alert(config, state, "config_error"):
@@ -1290,10 +1366,10 @@ def _run(argv, preloaded_config=None):
                     state["deliveries"]["line"]["last_sent_date"] = today_key
                 save_state(config["state_file"], state)
                 print("初回観測のため現在の発表を送信せず登録しました")
-                return 0
+                return int(reminder_failed)
         elif current.published_at < state["last_observed_published_at"]:
             print("前回観測より古い発表のため送信をスキップしました")
-            return 0
+            return int(reminder_failed)
 
     observation_is_new = args.force_send or is_new_observation(state, current)
     observation_is_equal = is_equal_observation(state, current)
@@ -1332,7 +1408,7 @@ def _run(argv, preloaded_config=None):
     if not send_line:
         print("送信対象の新しい発表ではないため送信をスキップしました")
         save_state(config["state_file"], state)
-        return 0
+        return int(reminder_failed)
 
     if config.get("enable_section_screenshot", False):
         try:
@@ -1447,7 +1523,7 @@ def _run(argv, preloaded_config=None):
                 )
             save_state(config["state_file"], state)
 
-    if delivery_failed:
+    if delivery_failed or reminder_failed:
         return 1
 
     if screenshot_url:

@@ -5,6 +5,7 @@
 次の値は実値をリポジトリ、`public_html`、ログへ保存しないでください。
 
 - LINE Messaging APIのアクセストークンとグループID
+- LINEチャネルシークレット、メンション対象ユーザーID、登録用のプロフィール名
 - ScreenshotOne APIキー
 - Xserver APIキー、FTP/FTPSパスワード
 - アラート用メールアドレス
